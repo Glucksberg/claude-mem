@@ -1,7 +1,7 @@
 /**
  * TelegramClient
  *
- * Minimal Telegram Bot API client for the crab-mem feed.
+ * Minimal Telegram Bot API client for the Claude-mem feed.
  * Supports getMe, getUpdates, getChat, sendMessage.
  * Base URL is overridable for testing with a mock server.
  */

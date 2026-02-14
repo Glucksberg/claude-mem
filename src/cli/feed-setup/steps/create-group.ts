@@ -10,7 +10,7 @@ export async function createGroupStep(botUsername: string): Promise<boolean | sy
   p.note(
     `Now create a Telegram group for your feed:\n\n` +
     `1. Open Telegram and create a new group\n` +
-    `2. Name it (e.g. "Crab-Mem Feed")\n` +
+    `2. Name it (e.g. "Claude-Mem Feed")\n` +
     `3. Add @${botUsername} to the group\n` +
     `4. Send any message in the group (so the bot can detect it)`,
     'Create a Telegram Group'

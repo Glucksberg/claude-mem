@@ -1,0 +1,41 @@
+# Dockerfile.feed-test
+#
+# Build and test the Claude-mem feed setup wizard against a mock Telegram API.
+# Usage: docker build -f docker/Dockerfile.feed-test -t claude-mem-feed-test .
+#        docker run --rm claude-mem-feed-test
+
+FROM oven/bun:1 AS base
+
+WORKDIR /app
+
+# Install Node.js (needed for the worker)
+RUN apt-get update && apt-get install -y curl && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy package files and install dependencies
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+
+# Copy source
+COPY . .
+
+# Build
+RUN npm run build
+
+# Test entrypoint
+FROM base AS test
+
+ENV TELEGRAM_API_BASE=http://localhost:8443
+ENV CLAUDE_MEM_DATA_DIR=/tmp/claude-mem
+ENV MOCK_PORT=8443
+
+# Create data directory
+RUN mkdir -p /tmp/claude-mem
+
+# Test script
+COPY docker/run-feed-test.sh /app/docker/run-feed-test.sh
+RUN chmod +x /app/docker/run-feed-test.sh
+
+CMD ["/app/docker/run-feed-test.sh"]

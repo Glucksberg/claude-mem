@@ -19,7 +19,7 @@ export async function testMessageStep(
     const client = new TelegramClient(botToken);
     await client.sendMessage(
       chatId,
-      '\u{1F980} Crab-Mem Feed connected! Session observations will appear here.'
+      '\u{1F9E0} Claude-Mem Feed connected! Session observations will appear here.'
     );
     s.stop('Test message sent!');
   } catch (err) {

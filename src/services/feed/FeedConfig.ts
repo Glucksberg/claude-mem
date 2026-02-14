@@ -1,7 +1,7 @@
 /**
  * FeedConfig
  *
- * Configuration types, loading, saving, and validation for the crab-mem feed.
+ * Configuration types, loading, saving, and validation for the Claude-mem feed.
  * Feed settings are stored in ~/.claude-mem/settings.json alongside other settings.
  */
 

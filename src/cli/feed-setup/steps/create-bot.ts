@@ -18,8 +18,8 @@ export async function createBotStep(presetToken?: string): Promise<CreateBotResu
     `To set up the feed, you need a Telegram bot.\n\n` +
     `1. Open Telegram and search for @BotFather\n` +
     `2. Send /newbot\n` +
-    `3. Choose a name (e.g. "Crab-Mem Feed")\n` +
-    `4. Choose a username (e.g. "crabmem_feed_bot")\n` +
+    `3. Choose a name (e.g. "Claude-Mem Feed")\n` +
+    `4. Choose a username (e.g. "claudemem_feed_bot")\n` +
     `5. Copy the bot token BotFather gives you`,
     'Create a Telegram Bot'
   );

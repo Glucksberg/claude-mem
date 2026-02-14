@@ -114,7 +114,7 @@ export class FeedDaemon {
     const client = this.client ?? new TelegramClient(config.botToken);
     await client.sendMessage(
       config.chatId,
-      '\u{1F980} Crab-Mem Feed connected! Session observations will appear here.'
+      '\u{1F9E0} Claude-Mem Feed connected! Session observations will appear here.'
     );
   }
 

@@ -30,7 +30,7 @@ export interface WizardOptions {
 export async function runFeedSetupWizard(options: WizardOptions = {}): Promise<void> {
   const { nonInteractive = false, botToken: presetToken, chatId: presetChatId } = options;
 
-  p.intro('\u{1F980} Crab-Mem Feed Setup');
+  p.intro('\u{1F9E0} Claude-Mem Feed Setup');
 
   // Non-interactive mode requires both --bot-token and --chat-id
   if (nonInteractive && (!presetToken || !presetChatId)) {
