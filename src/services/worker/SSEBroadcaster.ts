@@ -26,6 +26,7 @@ function resolveHeartbeatIntervalMs(raw: string | undefined): number {
 export class SSEBroadcaster {
   private sseClients: Set<SSEClient> = new Set();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private internalListeners: Set<(event: SSEEvent) => void> = new Set();
 
   constructor(
     private readonly heartbeatIntervalMs: number = resolveHeartbeatIntervalMs(process.env.CLAUDE_MEM_SSE_HEARTBEAT_MS)
@@ -63,12 +64,28 @@ export class SSEBroadcaster {
   }
 
   /**
-   * Broadcast an event to all connected clients (single-pass)
+   * Register an internal listener that receives all broadcast events without HTTP loopback.
+   * Returns an unsubscribe function.
+   */
+  onBroadcast(cb: (event: SSEEvent) => void): () => void {
+    this.internalListeners.add(cb);
+    return () => { this.internalListeners.delete(cb); };
+  }
+
+  /**
+   * Broadcast an event to all connected clients and internal listeners (single-pass)
    */
   broadcast(event: SSEEvent): void {
+    const eventWithTimestamp = { ...event, timestamp: Date.now() };
+
+    // Notify internal listeners regardless of SSE client count
+    for (const listener of this.internalListeners) {
+      try { listener(eventWithTimestamp); } catch { /* swallow listener errors */ }
+    }
+
     if (this.sseClients.size === 0) {
       logger.debug('WORKER', 'SSE broadcast skipped (no clients)', { eventType: event.type });
-      return; // Short-circuit if no clients
+      return;
     }
 
     const data = this.serializeEvent(event);
