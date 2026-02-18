@@ -2,6 +2,83 @@
 
 All notable changes to claude-mem.
 
+## [v10.2.5] - 2026-02-18
+
+### Bug Fixes
+
+- **Self-healing message queue**: Renamed `claimAndDelete` → `claimNextMessage` with atomic self-healing — automatically resets stale processing messages (>60s) back to pending before claiming, eliminating stuck messages from generator crashes without external timers
+- **Removed redundant idle-timeout reset**: The `resetStaleProcessingMessages()` call during idle timeout in worker-service was removed (startup reset kept), since the atomic self-healing in `claimNextMessage` now handles recovery inline
+- **TypeScript diagnostic fix**: Added `QUEUE` to logger `Component` type
+
+### Tests
+
+- 5 new tests for self-healing behavior (stuck recovery, active protection, atomicity, empty queue, session isolation)
+- 1 new integration test for stuck recovery in zombie-prevention suite
+- All existing queue tests updated for renamed method
+
+## [v10.2.4] - 2026-02-18
+
+## Chroma Vector DB Backfill Fix
+
+Fixes the Chroma backfill system to correctly sync all SQLite observations into the vector database on worker startup.
+
+### Bug Fixes
+
+- **Backfill all projects on startup** — `backfillAllProjects()` now runs on worker startup, iterating all projects in SQLite and syncing missing observations to Chroma. Previously `ensureBackfilled()` existed but was never called, leaving Chroma with incomplete data after cache clears.
+
+- **Fixed critical collection routing bug** — Backfill now uses the shared `cm__claude-mem` collection (matching how DatabaseManager and SearchManager operate) instead of creating per-project orphan collections that no search path reads from.
+
+- **Hardened collection name sanitization** — Project names with special characters (e.g., "YC Stuff") are sanitized for Chroma's naming constraints, including stripping trailing non-alphanumeric characters.
+
+- **Eliminated shared mutable state** — `ensureBackfilled()` and `getExistingChromaIds()` now accept project as a parameter instead of mutating instance state, keeping a single Chroma connection while avoiding fragile property mutation across iterations.
+
+- **Chroma readiness guard** — Backfill waits for Chroma server readiness before running, preventing spurious error logs when Chroma fails to start.
+
+### Changed Files
+
+- `src/services/sync/ChromaSync.ts` — Core backfill logic, sanitization, parameter passing
+- `src/services/worker-service.ts` — Startup backfill trigger + readiness guard
+- `src/utils/logger.ts` — Added `CHROMA_SYNC` log component
+
+## [v10.2.3] - 2026-02-17
+
+## Fix Chroma ONNX Model Cache Corruption
+
+Addresses the persistent embedding pipeline failures reported across #1104, #1105, #1110, and subsequent sessions. Three root causes identified and fixed:
+
+### Changes
+
+- **Removed nuclear `bun pm cache rm`** from both `smart-install.js` and `sync-marketplace.cjs`. This was added in v10.2.2 for the now-removed sharp dependency but destroyed all cached packages, breaking the ONNX resolution chain.
+- **Added `bun install` in plugin cache directory** after marketplace sync. The cache directory had a `package.json` with `@chroma-core/default-embed` as a dependency but never ran install, so the worker couldn't resolve it at runtime.
+- **Moved HuggingFace model cache to `~/.claude-mem/models/`** outside `node_modules`. The ~23MB ONNX model was stored inside `node_modules/@huggingface/transformers/.cache/`, so any reinstall or cache clear corrupted it.
+- **Added self-healing retry** for Protobuf parsing failures. If the downloaded model is corrupted, the cache is cleared and re-downloaded automatically on next use.
+
+### Files Changed
+
+- `scripts/smart-install.js` — removed `bun pm cache rm`
+- `scripts/sync-marketplace.cjs` — removed `bun pm cache rm`, added `bun install` in cache dir
+- `src/services/sync/ChromaSync.ts` — moved model cache, added corruption recovery
+
+## [v10.2.2] - 2026-02-17
+
+## Bug Fixes
+
+- **Removed `node-addon-api` dev dependency** — was only needed for `sharp`, which was already removed in v10.2.1
+- **Simplified native module cache clearing** in `smart-install.js` and `sync-marketplace.cjs` — replaced targeted `@img/sharp` directory deletion and lockfile removal with `bun pm cache rm`
+- Reduced ~30 lines of brittle file system manipulation to a clean Bun CLI command
+
+## [v10.2.1] - 2026-02-16
+
+## Bug Fixes
+
+- **Bun install & sharp native modules**: Fixed stale native module cache issues on Bun updates, added `node-addon-api` as a dev dependency required by sharp (#1140)
+- **PendingMessageStore consolidation**: Deduplicated PendingMessageStore initialization in worker-service; added session-scoped filtering to `resetStaleProcessingMessages` to prevent cross-session message resets (#1140)
+- **Gemini empty response handling**: Fixed silent message deletion when Gemini returns empty summary responses — now logs a warning and preserves the original message (#1138)
+- **Idle timeout session scoping**: Fixed idle timeout handler to only reset messages for the timed-out session instead of globally resetting all sessions (#1138)
+- **Shell injection in sync-marketplace**: Replaced `execSync` with `spawnSync` for rsync calls to eliminate command injection via gitignore patterns (#1138)
+- **Sharp cache invalidation**: Added cache clearing for sharp's native bindings when Bun version changes (#1138)
+- **Marketplace install**: Switched marketplace sync from npm to bun for package installation consistency (#1140)
+
 ## [v10.1.0] - 2026-02-16
 
 ## SessionStart System Message & Cleaner Defaults
@@ -1357,122 +1434,4 @@ This release significantly reduces the token footprint of the plugin's MCP tools
 - Comprehensive test suite for session ID refactoring
 
 **Full Changelog**: https://github.com/thedotmack/claude-mem/compare/v8.2.5...v8.2.6
-
-## [v8.2.5] - 2025-12-28
-
-## Bug Fixes
-
-- **Logger**: Enhanced Error object handling in debug mode to prevent empty JSON serialization
-- **ChromaSync**: Refactored DatabaseManager to initialize ChromaSync lazily, removing background backfill on startup
-- **SessionManager**: Simplified message handling and removed linger timeout that was blocking completion
-
-## Technical Details
-
-This patch release addresses several issues discovered after the session continuity fix:
-
-1. Logger now properly serializes Error objects with stack traces in debug mode
-2. ChromaSync initialization is now lazy to prevent silent failures during startup
-3. Session linger timeout removed to eliminate artificial 5-second delays on session completion
-
-Full changelog: https://github.com/thedotmack/claude-mem/compare/v8.2.4...v8.2.5
-
-## [v8.2.4] - 2025-12-28
-
-Patch release v8.2.4
-
-## [v8.2.3] - 2025-12-27
-
-## Bug Fixes
-
-- Fix worker port environment variable in smart-install script
-- Implement file-based locking mechanism for worker operations to prevent race conditions
-- Fix restart command references in documentation (changed from `claude-mem restart` to `npm run worker:restart`)
-
-## [v8.2.2] - 2025-12-27
-
-## What's Changed
-
-### Features
-- Add OpenRouter provider settings and documentation
-- Add modal footer with save button and status indicators
-- Implement self-spawn pattern for background worker execution
-
-### Bug Fixes
-- Resolve critical error handling issues in worker lifecycle
-- Handle Windows/Unix kill errors in orphaned process cleanup
-- Validate spawn pid before writing PID file
-- Handle process exit in waitForProcessesExit filter
-- Use readiness endpoint for health checks instead of port check
-- Add missing OpenRouter and Gemini settings to settingKeys array
-
-### Other Changes
-- Enhance error handling and validation in agents and routes
-- Delete obsolete process management files (ProcessManager, worker-wrapper, worker-cli)
-- Update hooks.json to use worker-service.cjs CLI
-- Add comprehensive tests for hook constants and worker spawn functionality
-
-## [v8.2.1] - 2025-12-27
-
-## 🔧 Worker Lifecycle Hardening
-
-This patch release addresses critical bugs discovered during PR review of the self-spawn pattern introduced in 8.2.0. The worker daemon now handles edge cases robustly across both Unix and Windows platforms.
-
-### 🐛 Critical Bug Fixes
-
-#### Process Exit Detection Fixed
-The `waitForProcessesExit` function was crashing when processes exited during monitoring. The `process.kill(pid, 0)` call throws when a process no longer exists, which was not being caught. Now wrapped in try/catch to correctly identify exited processes.
-
-#### Spawn PID Validation
-The worker daemon now validates that `spawn()` actually returned a valid PID before writing to the PID file. Previously, spawn failures could leave invalid PID files that broke subsequent lifecycle operations.
-
-#### Cross-Platform Orphan Cleanup
-- **Unix**: Replaced single `kill` command with individual `process.kill()` calls wrapped in try/catch, so one already-exited process doesn't abort cleanup of remaining orphans
-- **Windows**: Wrapped `taskkill` calls in try/catch for the same reason
-
-#### Health Check Reliability
-Changed `waitForHealth` to use the `/api/readiness` endpoint (returns 503 until fully initialized) instead of just checking if the port is in use. Callers now wait for *actual* worker readiness, not just network availability.
-
-### 🔄 Refactoring
-
-#### Code Consolidation (-580 lines)
-Deleted obsolete process management infrastructure that was replaced by the self-spawn pattern:
-- `src/services/process/ProcessManager.ts` (433 lines) - PID management now in worker-service
-- `src/cli/worker-cli.ts` (81 lines) - CLI handling now in worker-service
-- `src/services/worker-wrapper.ts` (157 lines) - Replaced by `--daemon` flag
-
-#### Updated Hook Commands
-All hooks now use `worker-service.cjs` CLI directly instead of the deleted `worker-cli.js`.
-
-### ⏱️ Timeout Adjustments
-
-Increased timeouts throughout for compatibility with slow systems:
-
-| Component | Before | After |
-|-----------|--------|-------|
-| Default hook timeout | 120s | 300s |
-| Health check timeout | 1s | 30s |
-| Health check retries | 15 | 300 |
-| Context initialization | 30s | 300s |
-| MCP connection | 15s | 300s |
-| PowerShell commands | 5s | 60s |
-| Git commands | 30s | 300s |
-| NPM install | 120s | 600s |
-| Hook worker commands | 30s | 180s |
-
-### 🧪 Testing
-
-Added comprehensive test suites:
-- `tests/hook-constants.test.ts` - Validates timeout configurations
-- `tests/worker-spawn.test.ts` - Tests worker CLI and health endpoints
-
-### 🛡️ Additional Robustness
-
-- PID validation in restart command (matches start command behavior)
-- Try/catch around `forceKillProcess()` for graceful shutdown
-- Try/catch around `getChildProcesses()` for Windows failures
-- Improved logging for PID file operations and HTTP shutdown
-
----
-
-**Full Changelog**: https://github.com/thedotmack/claude-mem/compare/v8.2.0...v8.2.1
 

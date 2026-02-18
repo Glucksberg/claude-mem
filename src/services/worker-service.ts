@@ -19,6 +19,7 @@ import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
 import { getAuthMethodDescription } from '../shared/EnvManager.js';
 import { logger } from '../utils/logger.js';
 import { ChromaServerManager } from './sync/ChromaServerManager.js';
+import { ChromaSync } from './sync/ChromaSync.js';
 
 // Windows: avoid repeated spawn popups when startup fails (issue #921)
 const WINDOWS_SPAWN_COOLDOWN_MS = 2 * 60 * 1000;
@@ -423,6 +424,15 @@ export class WorkerService {
       this.server.registerRoutes(this.searchRoutes);
       logger.info('WORKER', 'SearchManager initialized and search routes registered');
 
+      // Auto-backfill Chroma for all projects if out of sync with SQLite (fire-and-forget)
+      if (this.chromaServer !== null || chromaMode !== 'local') {
+        ChromaSync.backfillAllProjects().then(() => {
+          logger.info('CHROMA_SYNC', 'Backfill check complete for all projects');
+        }).catch(error => {
+          logger.error('CHROMA_SYNC', 'Backfill failed (non-blocking)', {}, error as Error);
+        });
+      }
+
       // Connect to MCP server
       const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
       const transport = new StdioClientTransport({
@@ -604,9 +614,22 @@ export class WorkerService {
           return;
         }
 
-        // Check if there's pending work that needs processing with a fresh AbortController
+        // Store for pending-count check below
         const { PendingMessageStore } = require('./sqlite/PendingMessageStore.js');
         const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
+
+        // Idle timeout means no new work arrived for 3 minutes - don't restart
+        // No need to reset stale processing messages here — claimNextMessage() self-heals
+        if (session.idleTimedOut) {
+          logger.info('SYSTEM', 'Generator exited due to idle timeout, not restarting', {
+            sessionId: session.sessionDbId
+          });
+          session.idleTimedOut = false; // Reset flag
+          this.broadcastProcessingStatus();
+          return;
+        }
+
+        // Check if there's pending work that needs processing with a fresh AbortController
         const pendingCount = pendingStore.getPendingCount(session.sessionDbId);
 
         if (pendingCount > 0) {
