@@ -18,7 +18,7 @@ import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
 import { getAuthMethodDescription } from '../shared/EnvManager.js';
 import { logger } from '../utils/logger.js';
-import { ChromaServerManager } from './sync/ChromaServerManager.js';
+import { ChromaMcpManager } from './sync/ChromaMcpManager.js';
 import { ChromaSync } from './sync/ChromaSync.js';
 
 // Windows: avoid repeated spawn popups when startup fails (issue #921)
@@ -59,6 +59,10 @@ function clearWorkerSpawnAttempted(): void {
   }
 }
 
+// Re-export for backward compatibility — canonical implementation in shared/plugin-state.ts
+export { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
+import { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
+
 // Version injected at build time by esbuild define
 declare const __DEFAULT_PACKAGE_VERSION__: string;
 const packageVersion = typeof __DEFAULT_PACKAGE_VERSION__ !== 'undefined' ? __DEFAULT_PACKAGE_VERSION__ : '0.0.0-dev';
@@ -69,14 +73,19 @@ import {
   readPidFile,
   removePidFile,
   getPlatformTimeout,
-  cleanupOrphanedProcesses,
+  aggressiveStartupCleanup,
+  runOneTimeChromaMigration,
   cleanStalePidFile,
+  isProcessAlive,
   spawnDaemon,
-  createSignalHandler
+  createSignalHandler,
+  isPidFileRecent,
+  touchPidFile
 } from './infrastructure/ProcessManager.js';
 import {
   isPortInUse,
   waitForHealth,
+  waitForReadiness,
   waitForPortFree,
   httpShutdown,
   checkVersionMatch
@@ -116,7 +125,7 @@ import { LogsRoutes } from './worker/http/routes/LogsRoutes.js';
 import { MemoryRoutes } from './worker/http/routes/MemoryRoutes.js';
 
 // Process management for zombie cleanup (Issue #737)
-import { startOrphanReaper, reapOrphanedProcesses } from './worker/ProcessRegistry.js';
+import { startOrphanReaper, reapOrphanedProcesses, getProcessBySession, ensureProcessExit } from './worker/ProcessRegistry.js';
 
 /**
  * Build JSON status output for hook framework communication.
@@ -166,8 +175,8 @@ export class WorkerService {
   // Route handlers
   private searchRoutes: SearchRoutes | null = null;
 
-  // Chroma server (local mode)
-  private chromaServer: ChromaServerManager | null = null;
+  // Chroma MCP manager (lazy - connects on first use)
+  private chromaMcpManager: ChromaMcpManager | null = null;
 
   // Initialization tracking
   private initializationComplete: Promise<void>;
@@ -175,6 +184,9 @@ export class WorkerService {
 
   // Orphan reaper cleanup function (Issue #737)
   private stopOrphanReaper: (() => void) | null = null;
+
+  // Stale session reaper interval (Issue #1168)
+  private staleSessionReaperInterval: ReturnType<typeof setInterval> | null = null;
 
   // AI interaction tracking for health endpoint
   private lastAiInteraction: {
@@ -364,36 +376,28 @@ export class WorkerService {
    */
   private async initializeBackground(): Promise<void> {
     try {
-      await cleanupOrphanedProcesses();
+      await aggressiveStartupCleanup();
 
       // Load mode configuration
       const { ModeManager } = await import('./domain/ModeManager.js');
       const { SettingsDefaultsManager } = await import('../shared/SettingsDefaultsManager.js');
       const { USER_SETTINGS_PATH } = await import('../shared/paths.js');
-      const os = await import('os');
 
       const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
-      // Start Chroma server if in local mode
-      const chromaMode = settings.CLAUDE_MEM_CHROMA_MODE || 'local';
-      if (chromaMode === 'local') {
-        logger.info('SYSTEM', 'Starting local Chroma server...');
-        this.chromaServer = ChromaServerManager.getInstance({
-          dataDir: path.join(os.homedir(), '.claude-mem', 'vector-db'),
-          host: settings.CLAUDE_MEM_CHROMA_HOST || '127.0.0.1',
-          port: parseInt(settings.CLAUDE_MEM_CHROMA_PORT || '8000', 10)
-        });
+      // One-time chroma wipe for users upgrading from versions with duplicate worker bugs.
+      // Only runs in local mode (chroma is local-only). Backfill at line ~414 rebuilds from SQLite.
+      if (settings.CLAUDE_MEM_MODE === 'local' || !settings.CLAUDE_MEM_MODE) {
+        runOneTimeChromaMigration();
+      }
 
-        const ready = await this.chromaServer.start(60000);
-
-        if (ready) {
-          logger.success('SYSTEM', 'Chroma server ready');
-        } else {
-          logger.warn('SYSTEM', 'Chroma server failed to start - vector search disabled');
-          this.chromaServer = null;
-        }
+      // Initialize ChromaMcpManager only if Chroma is enabled
+      const chromaEnabled = settings.CLAUDE_MEM_CHROMA_ENABLED !== 'false';
+      if (chromaEnabled) {
+        this.chromaMcpManager = ChromaMcpManager.getInstance();
+        logger.info('SYSTEM', 'ChromaMcpManager initialized (lazy - connects on first use)');
       } else {
-        logger.info('SYSTEM', 'Chroma remote mode - skipping local server');
+        logger.info('SYSTEM', 'Chroma disabled via CLAUDE_MEM_CHROMA_ENABLED=false, skipping ChromaMcpManager');
       }
 
       const modeId = settings.CLAUDE_MEM_MODE;
@@ -424,8 +428,15 @@ export class WorkerService {
       this.server.registerRoutes(this.searchRoutes);
       logger.info('WORKER', 'SearchManager initialized and search routes registered');
 
+      // DB and search are ready — mark initialization complete so hooks can proceed.
+      // MCP connection is tracked separately via mcpReady and is NOT required for
+      // the worker to serve context/search requests.
+      this.initializationCompleteFlag = true;
+      this.resolveInitialization();
+      logger.info('SYSTEM', 'Core initialization complete (DB + search ready)');
+
       // Auto-backfill Chroma for all projects if out of sync with SQLite (fire-and-forget)
-      if (this.chromaServer !== null || chromaMode !== 'local') {
+      if (this.chromaMcpManager) {
         ChromaSync.backfillAllProjects().then(() => {
           logger.info('CHROMA_SYNC', 'Backfill check complete for all projects');
         }).catch(error => {
@@ -449,11 +460,7 @@ export class WorkerService {
 
       await Promise.race([mcpConnectionPromise, timeoutPromise]);
       this.mcpReady = true;
-      logger.success('WORKER', 'Connected to MCP server');
-
-      this.initializationCompleteFlag = true;
-      this.resolveInitialization();
-      logger.info('SYSTEM', 'Background initialization complete');
+      logger.success('WORKER', 'MCP server connected');
 
       // Start orphan reaper to clean up zombie processes (Issue #737)
       this.stopOrphanReaper = startOrphanReaper(() => {
@@ -464,6 +471,18 @@ export class WorkerService {
         return activeIds;
       });
       logger.info('SYSTEM', 'Started orphan reaper (runs every 5 minutes)');
+
+      // Reap stale sessions to unblock orphan process cleanup (Issue #1168)
+      this.staleSessionReaperInterval = setInterval(async () => {
+        try {
+          const reaped = await this.sessionManager.reapStaleSessions();
+          if (reaped > 0) {
+            logger.info('SYSTEM', `Reaped ${reaped} stale sessions`);
+          }
+        } catch (e) {
+          logger.error('SYSTEM', 'Stale session reaper error', { error: e instanceof Error ? e.message : String(e) });
+        }
+      }, 2 * 60 * 1000);
 
       // Auto-recover orphaned queues (fire-and-forget with error logging)
       this.processPendingQueues(50).then(result => {
@@ -526,6 +545,9 @@ export class WorkerService {
     let sessionFailed = false;
 
     logger.info('SYSTEM', `Starting generator (${source}) using ${providerName}`, { sessionId: sid });
+
+    // Track generator activity for stale detection (Issue #1099)
+    session.lastGeneratorActivity = Date.now();
 
     session.generatorPromise = agent.startSession(session, this)
       .catch(async (error: unknown) => {
@@ -593,7 +615,13 @@ export class WorkerService {
         };
         throw error;
       })
-      .finally(() => {
+      .finally(async () => {
+        // CRITICAL: Verify subprocess exit to prevent zombie accumulation (Issue #1168)
+        const trackedProcess = getProcessBySession(session.sessionDbId);
+        if (trackedProcess && !trackedProcess.process.killed && trackedProcess.process.exitCode === null) {
+          await ensureProcessExit(trackedProcess, 5000);
+        }
+
         session.generatorPromise = null;
 
         // Record successful AI interaction if no error occurred
@@ -823,12 +851,18 @@ export class WorkerService {
       this.stopOrphanReaper = null;
     }
 
+    // Stop stale session reaper (Issue #1168)
+    if (this.staleSessionReaperInterval) {
+      clearInterval(this.staleSessionReaperInterval);
+      this.staleSessionReaperInterval = null;
+    }
+
     await performGracefulShutdown({
       server: this.server.getHttpServer(),
       sessionManager: this.sessionManager,
       mcpClient: this.mcpClient,
       dbManager: this.dbManager,
-      chromaServer: this.chromaServer || undefined
+      chromaMcpManager: this.chromaMcpManager || undefined
     });
   }
 
@@ -873,6 +907,23 @@ async function ensureWorkerStarted(port: number): Promise<boolean> {
   if (await waitForHealth(port, 1000)) {
     const versionCheck = await checkVersionMatch(port);
     if (!versionCheck.matches) {
+      // Guard: If PID file was written recently, another session is likely already
+      // restarting the worker. Poll health instead of starting a concurrent restart.
+      // This prevents the "100 sessions all restart simultaneously" storm (#1145).
+      const RESTART_COORDINATION_THRESHOLD_MS = 15000;
+      if (isPidFileRecent(RESTART_COORDINATION_THRESHOLD_MS)) {
+        logger.info('SYSTEM', 'Version mismatch detected but PID file is recent — another restart likely in progress, polling health', {
+          pluginVersion: versionCheck.pluginVersion,
+          workerVersion: versionCheck.workerVersion
+        });
+        const healthy = await waitForHealth(port, RESTART_COORDINATION_THRESHOLD_MS);
+        if (healthy) {
+          logger.info('SYSTEM', 'Worker became healthy after waiting for concurrent restart');
+          return true;
+        }
+        logger.warn('SYSTEM', 'Worker did not become healthy after waiting — proceeding with own restart');
+      }
+
       logger.info('SYSTEM', 'Worker version mismatch detected - auto-restarting', {
         pluginVersion: versionCheck.pluginVersion,
         workerVersion: versionCheck.workerVersion
@@ -929,7 +980,17 @@ async function ensureWorkerStarted(port: number): Promise<boolean> {
     return false;
   }
 
+  // Health passed (HTTP listening). Now wait for DB + search initialization
+  // so hooks that run immediately after can actually use the worker.
+  const ready = await waitForReadiness(port, getPlatformTimeout(HOOK_TIMEOUTS.READINESS_WAIT));
+  if (!ready) {
+    logger.warn('SYSTEM', 'Worker is alive but readiness timed out — proceeding anyway');
+  }
+
   clearWorkerSpawnAttempted();
+  // Touch PID file to signal other sessions that a restart just completed.
+  // Other sessions checking isPidFileRecent() will see this and skip their own restart.
+  touchPidFile();
   logger.info('SYSTEM', 'Worker started successfully');
   return true;
 }
@@ -940,6 +1001,14 @@ async function ensureWorkerStarted(port: number): Promise<boolean> {
 
 async function main() {
   const command = process.argv[2];
+
+  // Early exit if plugin is disabled in Claude Code settings (#781).
+  // Only gate hook-initiated commands; CLI management (stop/status) still works.
+  const hookInitiatedCommands = ['start', 'hook', 'restart', '--daemon'];
+  if ((hookInitiatedCommands.includes(command) || command === undefined) && isPluginDisabledInClaudeSettings()) {
+    process.exit(0);
+  }
+
   const port = getWorkerPort();
 
   // Helper for JSON status output in 'start' command
@@ -958,6 +1027,7 @@ async function main() {
       } else {
         exitWithStatus('error', 'Failed to start worker');
       }
+      break;
     }
 
     case 'stop': {
@@ -969,6 +1039,7 @@ async function main() {
       removePidFile();
       logger.info('SYSTEM', 'Worker stopped successfully');
       process.exit(0);
+      break;
     }
 
     case 'restart': {
@@ -1005,6 +1076,7 @@ async function main() {
 
       logger.info('SYSTEM', 'Worker restarted successfully');
       process.exit(0);
+      break;
     }
 
     case 'status': {
@@ -1019,12 +1091,14 @@ async function main() {
         console.log('Worker is not running');
       }
       process.exit(0);
+      break;
     }
 
     case 'cursor': {
       const subcommand = process.argv[3];
       const cursorResult = await handleCursorCommand(subcommand, process.argv.slice(4));
       process.exit(cursorResult);
+      break;
     }
 
     case 'hook': {
@@ -1078,6 +1152,7 @@ async function main() {
       const { generateClaudeMd } = await import('../cli/claude-md-commands.js');
       const result = await generateClaudeMd(dryRun);
       process.exit(result);
+      break;
     }
 
     case 'clean': {
@@ -1085,10 +1160,33 @@ async function main() {
       const { cleanClaudeMd } = await import('../cli/claude-md-commands.js');
       const result = await cleanClaudeMd(dryRun);
       process.exit(result);
+      break;
     }
 
     case '--daemon':
     default: {
+      // GUARD 1: Refuse to start if another worker is already alive (PID check).
+      // Instant check (kill -0) — no HTTP dependency.
+      const existingPidInfo = readPidFile();
+      if (existingPidInfo && isProcessAlive(existingPidInfo.pid)) {
+        logger.info('SYSTEM', 'Worker already running (PID alive), refusing to start duplicate', {
+          existingPid: existingPidInfo.pid,
+          existingPort: existingPidInfo.port,
+          startedAt: existingPidInfo.startedAt
+        });
+        process.exit(0);
+      }
+
+      // GUARD 2: Refuse to start if the port is already bound.
+      // Catches the race where two daemons start simultaneously before
+      // either writes a PID file. Must run BEFORE constructing WorkerService
+      // because the constructor registers signal handlers and timers that
+      // prevent the process from exiting even if listen() fails later.
+      if (await isPortInUse(port)) {
+        logger.info('SYSTEM', 'Port already in use, refusing to start duplicate', { port });
+        process.exit(0);
+      }
+
       // Prevent daemon from dying silently on unhandled errors.
       // The HTTP server can continue serving even if a background task throws.
       process.on('unhandledRejection', (reason) => {
@@ -1119,5 +1217,8 @@ const isMainModule = typeof require !== 'undefined' && typeof module !== 'undefi
   : import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('worker-service');
 
 if (isMainModule) {
-  main();
+  main().catch((error) => {
+    logger.error('SYSTEM', 'Fatal error in main', {}, error instanceof Error ? error : undefined);
+    process.exit(0);  // Exit 0: don't block Claude Code, don't leave Windows Terminal tabs open
+  });
 }

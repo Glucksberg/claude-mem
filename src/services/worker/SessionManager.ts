@@ -155,7 +155,8 @@ export class SessionManager {
       conversationHistory: [],  // Initialize empty - will be populated by agents
       currentProvider: null,  // Will be set when generator starts
       consecutiveRestarts: 0,  // Track consecutive restart attempts to prevent infinite loops
-      processingMessageIds: []  // CLAIM-CONFIRM: Track message IDs for confirmProcessed()
+      processingMessageIds: [],  // CLAIM-CONFIRM: Track message IDs for confirmProcessed()
+      lastGeneratorActivity: Date.now()  // Initialize for stale detection (Issue #1099)
     };
 
     logger.debug('SESSION', 'Creating new session object (memorySessionId cleared to prevent stale resume)', {
@@ -286,10 +287,16 @@ export class SessionManager {
     // 1. Abort the SDK agent
     session.abortController.abort();
 
-    // 2. Wait for generator to finish
+    // 2. Wait for generator to finish (with 30s timeout to prevent stale stall, Issue #1099)
     if (session.generatorPromise) {
-      await session.generatorPromise.catch(() => {
+      const generatorDone = session.generatorPromise.catch(() => {
         logger.debug('SYSTEM', 'Generator already failed, cleaning up', { sessionId: session.sessionDbId });
+      });
+      const timeoutDone = new Promise<void>(resolve => {
+        AbortSignal.timeout(30_000).addEventListener('abort', () => resolve(), { once: true });
+      });
+      await Promise.race([generatorDone, timeoutDone]).then(() => {}, () => {
+        logger.warn('SESSION', 'Generator did not exit within 30s after abort, forcing cleanup (#1099)', { sessionDbId });
       });
     }
 
@@ -339,6 +346,39 @@ export class SessionManager {
     if (this.onSessionDeletedCallback) {
       this.onSessionDeletedCallback();
     }
+  }
+
+  private static readonly MAX_SESSION_IDLE_MS = 15 * 60 * 1000; // 15 minutes
+
+  /**
+   * Reap sessions with no active generator and no pending work that have been idle too long.
+   * This unblocks the orphan reaper which skips processes for "active" sessions. (Issue #1168)
+   */
+  async reapStaleSessions(): Promise<number> {
+    const now = Date.now();
+    const staleSessionIds: number[] = [];
+
+    for (const [sessionDbId, session] of this.sessions) {
+      // Skip sessions with active generators
+      if (session.generatorPromise) continue;
+
+      // Skip sessions with pending work
+      const pendingCount = this.getPendingStore().getPendingCount(sessionDbId);
+      if (pendingCount > 0) continue;
+
+      // No generator + no pending work + old enough = stale
+      const sessionAge = now - session.startTime;
+      if (sessionAge > SessionManager.MAX_SESSION_IDLE_MS) {
+        staleSessionIds.push(sessionDbId);
+      }
+    }
+
+    for (const sessionDbId of staleSessionIds) {
+      logger.warn('SESSION', `Reaping stale session ${sessionDbId} (no activity for >${Math.round(SessionManager.MAX_SESSION_IDLE_MS / 60000)}m)`, { sessionDbId });
+      await this.deleteSession(sessionDbId);
+    }
+
+    return staleSessionIds.length;
   }
 
   /**
@@ -434,6 +474,9 @@ export class SessionManager {
       } else {
         session.earliestPendingTimestamp = Math.min(session.earliestPendingTimestamp, message._originalTimestamp);
       }
+
+      // Update generator activity for stale detection (Issue #1099)
+      session.lastGeneratorActivity = Date.now();
 
       yield message;
     }

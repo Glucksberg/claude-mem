@@ -10,7 +10,7 @@
 
 import path from 'path';
 import { homedir } from 'os';
-import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdirSync } from 'fs';
+import { existsSync, writeFileSync, readFileSync, unlinkSync, mkdirSync, rmSync, statSync, utimesSync } from 'fs';
 import { exec, execSync, spawn } from 'child_process';
 import { promisify } from 'util';
 import { logger } from '../../utils/logger.js';
@@ -54,7 +54,8 @@ function lookupBinaryInPath(binaryName: string, platform: NodeJS.Platform): stri
   try {
     const output = execSync(command, {
       stdio: ['ignore', 'pipe', 'ignore'],
-      encoding: 'utf-8'
+      encoding: 'utf-8',
+      windowsHide: true
     });
 
     const firstMatch = output
@@ -191,10 +192,10 @@ export async function getChildProcesses(parentPid: number): Promise<number[]> {
   }
 
   try {
-    // PowerShell Get-Process instead of WMIC (deprecated in Windows 11)
-    const cmd = `powershell -NoProfile -NonInteractive -Command "Get-Process | Where-Object { $_.ParentProcessId -eq ${parentPid} } | Select-Object -ExpandProperty Id"`;
-    const { stdout } = await execAsync(cmd, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND });
-    // PowerShell outputs just numbers (one per line), simpler than WMIC's "ProcessId=1234" format
+    // Use WQL -Filter to avoid $_ pipeline syntax that breaks in Git Bash (#1062, #1024).
+    // Get-CimInstance with server-side filtering is also more efficient than piping through Where-Object.
+    const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter 'ParentProcessId=${parentPid}' | Select-Object -ExpandProperty ProcessId"`;
+    const { stdout } = await execAsync(cmd, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, windowsHide: true });
     return stdout
       .split('\n')
       .map(line => line.trim())
@@ -223,7 +224,7 @@ export async function forceKillProcess(pid: number): Promise<void> {
   try {
     if (process.platform === 'win32') {
       // /T kills entire process tree, /F forces termination
-      await execAsync(`taskkill /PID ${pid} /T /F`, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND });
+      await execAsync(`taskkill /PID ${pid} /T /F`, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, windowsHide: true });
     } else {
       process.kill(pid, 'SIGKILL');
     }
@@ -315,13 +316,14 @@ export async function cleanupOrphanedProcesses(): Promise<void> {
 
   try {
     if (isWindows) {
-      // Windows: Use PowerShell Get-CimInstance with JSON output for age filtering
-      const patternConditions = ORPHAN_PROCESS_PATTERNS
-        .map(p => `$_.CommandLine -like '*${p}*'`)
-        .join(' -or ');
+      // Windows: Use WQL -Filter for server-side filtering (no $_ pipeline syntax).
+      // Avoids Git Bash $_ interpretation (#1062) and PowerShell syntax errors (#1024).
+      const wqlPatternConditions = ORPHAN_PROCESS_PATTERNS
+        .map(p => `CommandLine LIKE '%${p}%'`)
+        .join(' OR ');
 
-      const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process | Where-Object { (${patternConditions}) -and $_.ProcessId -ne ${currentPid} } | Select-Object ProcessId, CreationDate | ConvertTo-Json"`;
-      const { stdout } = await execAsync(cmd, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND });
+      const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter '(${wqlPatternConditions}) AND ProcessId != ${currentPid}' | Select-Object ProcessId, CreationDate | ConvertTo-Json"`;
+      const { stdout } = await execAsync(cmd, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, windowsHide: true });
 
       if (!stdout.trim() || stdout.trim() === 'null') {
         logger.debug('SYSTEM', 'No orphaned claude-mem processes found (Windows)');
@@ -406,7 +408,7 @@ export async function cleanupOrphanedProcesses(): Promise<void> {
         continue;
       }
       try {
-        execSync(`taskkill /PID ${pid} /T /F`, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, stdio: 'ignore' });
+        execSync(`taskkill /PID ${pid} /T /F`, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, stdio: 'ignore', windowsHide: true });
       } catch (error) {
         // [ANTI-PATTERN IGNORED]: Cleanup loop - process may have exited, continue to next PID
         logger.debug('SYSTEM', 'Failed to kill process, may have already exited', { pid }, error as Error);
@@ -424,6 +426,184 @@ export async function cleanupOrphanedProcesses(): Promise<void> {
   }
 
   logger.info('SYSTEM', 'Orphaned processes cleaned up', { count: pidsToKill.length });
+}
+
+// Patterns that should be killed immediately at startup (no age gate)
+// These are child processes that should not outlive their parent worker
+const AGGRESSIVE_CLEANUP_PATTERNS = ['worker-service.cjs', 'chroma-mcp'];
+
+// Patterns that keep the age-gated threshold (may be legitimately running)
+const AGE_GATED_CLEANUP_PATTERNS = ['mcp-server.cjs'];
+
+/**
+ * Aggressive startup cleanup for orphaned claude-mem processes.
+ *
+ * Unlike cleanupOrphanedProcesses() which age-gates everything at 30 minutes,
+ * this function kills worker-service.cjs and chroma-mcp processes immediately
+ * (they should not outlive their parent worker). Only mcp-server.cjs keeps
+ * the age threshold since it may be legitimately running.
+ *
+ * Called once at daemon startup.
+ */
+export async function aggressiveStartupCleanup(): Promise<void> {
+  const isWindows = process.platform === 'win32';
+  const currentPid = process.pid;
+  const pidsToKill: number[] = [];
+  const allPatterns = [...AGGRESSIVE_CLEANUP_PATTERNS, ...AGE_GATED_CLEANUP_PATTERNS];
+
+  try {
+    if (isWindows) {
+      // Use WQL -Filter for server-side filtering (no $_ pipeline syntax).
+      // Avoids Git Bash $_ interpretation (#1062) and PowerShell syntax errors (#1024).
+      const wqlPatternConditions = allPatterns
+        .map(p => `CommandLine LIKE '%${p}%'`)
+        .join(' OR ');
+
+      const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter '(${wqlPatternConditions}) AND ProcessId != ${currentPid}' | Select-Object ProcessId, CommandLine, CreationDate | ConvertTo-Json"`;
+      const { stdout } = await execAsync(cmd, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, windowsHide: true });
+
+      if (!stdout.trim() || stdout.trim() === 'null') {
+        logger.debug('SYSTEM', 'No orphaned claude-mem processes found (Windows)');
+        return;
+      }
+
+      const processes = JSON.parse(stdout);
+      const processList = Array.isArray(processes) ? processes : [processes];
+      const now = Date.now();
+
+      for (const proc of processList) {
+        const pid = proc.ProcessId;
+        if (!Number.isInteger(pid) || pid <= 0 || pid === currentPid) continue;
+
+        const commandLine = proc.CommandLine || '';
+        const isAggressive = AGGRESSIVE_CLEANUP_PATTERNS.some(p => commandLine.includes(p));
+
+        if (isAggressive) {
+          // Kill immediately — no age check
+          pidsToKill.push(pid);
+          logger.debug('SYSTEM', 'Found orphaned process (aggressive)', { pid, commandLine: commandLine.substring(0, 80) });
+        } else {
+          // Age-gated: only kill if older than threshold
+          const creationMatch = proc.CreationDate?.match(/\/Date\((\d+)\)\//);
+          if (creationMatch) {
+            const creationTime = parseInt(creationMatch[1], 10);
+            const ageMinutes = (now - creationTime) / (1000 * 60);
+            if (ageMinutes >= ORPHAN_MAX_AGE_MINUTES) {
+              pidsToKill.push(pid);
+              logger.debug('SYSTEM', 'Found orphaned process (age-gated)', { pid, ageMinutes: Math.round(ageMinutes) });
+            }
+          }
+        }
+      }
+    } else {
+      // Unix: Use ps with elapsed time
+      const patternRegex = allPatterns.join('|');
+      const { stdout } = await execAsync(
+        `ps -eo pid,etime,command | grep -E "${patternRegex}" | grep -v grep || true`
+      );
+
+      if (!stdout.trim()) {
+        logger.debug('SYSTEM', 'No orphaned claude-mem processes found (Unix)');
+        return;
+      }
+
+      const lines = stdout.trim().split('\n');
+      for (const line of lines) {
+        const match = line.trim().match(/^(\d+)\s+(\S+)\s+(.*)$/);
+        if (!match) continue;
+
+        const pid = parseInt(match[1], 10);
+        const etime = match[2];
+        const command = match[3];
+
+        if (!Number.isInteger(pid) || pid <= 0 || pid === currentPid) continue;
+
+        const isAggressive = AGGRESSIVE_CLEANUP_PATTERNS.some(p => command.includes(p));
+
+        if (isAggressive) {
+          // Kill immediately — no age check
+          pidsToKill.push(pid);
+          logger.debug('SYSTEM', 'Found orphaned process (aggressive)', { pid, command: command.substring(0, 80) });
+        } else {
+          // Age-gated: only kill if older than threshold
+          const ageMinutes = parseElapsedTime(etime);
+          if (ageMinutes >= ORPHAN_MAX_AGE_MINUTES) {
+            pidsToKill.push(pid);
+            logger.debug('SYSTEM', 'Found orphaned process (age-gated)', { pid, ageMinutes, command: command.substring(0, 80) });
+          }
+        }
+      }
+    }
+  } catch (error) {
+    logger.error('SYSTEM', 'Failed to enumerate orphaned processes during aggressive cleanup', {}, error as Error);
+    return;
+  }
+
+  if (pidsToKill.length === 0) {
+    return;
+  }
+
+  logger.info('SYSTEM', 'Aggressive startup cleanup: killing orphaned processes', {
+    platform: isWindows ? 'Windows' : 'Unix',
+    count: pidsToKill.length,
+    pids: pidsToKill
+  });
+
+  if (isWindows) {
+    for (const pid of pidsToKill) {
+      if (!Number.isInteger(pid) || pid <= 0) continue;
+      try {
+        execSync(`taskkill /PID ${pid} /T /F`, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, stdio: 'ignore', windowsHide: true });
+      } catch (error) {
+        logger.debug('SYSTEM', 'Failed to kill process, may have already exited', { pid }, error as Error);
+      }
+    }
+  } else {
+    for (const pid of pidsToKill) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch (error) {
+        logger.debug('SYSTEM', 'Process already exited', { pid }, error as Error);
+      }
+    }
+  }
+
+  logger.info('SYSTEM', 'Aggressive startup cleanup complete', { count: pidsToKill.length });
+}
+
+const CHROMA_MIGRATION_MARKER_FILENAME = '.chroma-cleaned-v10.3';
+
+/**
+ * One-time chroma data wipe for users upgrading from versions with duplicate
+ * worker bugs that could corrupt chroma data. Since chroma is always rebuildable
+ * from SQLite (via backfillAllProjects), this is safe.
+ *
+ * Checks for a marker file. If absent, wipes ~/.claude-mem/chroma/ and writes
+ * the marker. If present, skips. Idempotent.
+ *
+ * @param dataDirectory - Override for DATA_DIR (used in tests)
+ */
+export function runOneTimeChromaMigration(dataDirectory?: string): void {
+  const effectiveDataDir = dataDirectory ?? DATA_DIR;
+  const markerPath = path.join(effectiveDataDir, CHROMA_MIGRATION_MARKER_FILENAME);
+  const chromaDir = path.join(effectiveDataDir, 'chroma');
+
+  if (existsSync(markerPath)) {
+    logger.debug('SYSTEM', 'Chroma migration marker exists, skipping wipe');
+    return;
+  }
+
+  logger.warn('SYSTEM', 'Running one-time chroma data wipe (upgrade from pre-v10.3)', { chromaDir });
+
+  if (existsSync(chromaDir)) {
+    rmSync(chromaDir, { recursive: true, force: true });
+    logger.info('SYSTEM', 'Chroma data directory removed', { chromaDir });
+  }
+
+  // Write marker file to prevent future wipes
+  mkdirSync(effectiveDataDir, { recursive: true });
+  writeFileSync(markerPath, new Date().toISOString());
+  logger.info('SYSTEM', 'Chroma migration marker written', { markerPath });
 }
 
 /**
@@ -523,10 +703,10 @@ export function spawnDaemon(
  *
  * EPERM is treated as "alive" because it means the process exists but
  * belongs to a different user/session (common in multi-user setups).
- * PID 0 (Windows WMIC sentinel for unknown PID) is treated as alive.
+ * PID 0 (Windows sentinel for unknown PID) is treated as alive.
  */
 export function isProcessAlive(pid: number): boolean {
-  // PID 0 is the Windows WMIC sentinel value — process was spawned but PID unknown
+  // PID 0 is the Windows sentinel value — process was spawned but PID unknown
   if (pid === 0) return true;
 
   // Invalid PIDs are not alive
@@ -541,6 +721,39 @@ export function isProcessAlive(pid: number): boolean {
     if (code === 'EPERM') return true;
     // ESRCH = no such process — it's dead
     return false;
+  }
+}
+
+/**
+ * Check if the PID file was written recently (within thresholdMs).
+ *
+ * Used to coordinate restarts across concurrent sessions: if the PID file
+ * was recently written, another session likely just restarted the worker.
+ * Callers should poll /api/health instead of attempting their own restart.
+ *
+ * @param thresholdMs - Maximum age in ms to consider "recent" (default: 15000)
+ * @returns true if the PID file exists and was modified within thresholdMs
+ */
+export function isPidFileRecent(thresholdMs: number = 15000): boolean {
+  try {
+    const stats = statSync(PID_FILE);
+    return (Date.now() - stats.mtimeMs) < thresholdMs;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Touch the PID file to update its mtime without changing contents.
+ * Used after a restart to signal other sessions that a restart just completed.
+ */
+export function touchPidFile(): void {
+  try {
+    if (!existsSync(PID_FILE)) return;
+    const now = new Date();
+    utimesSync(PID_FILE, now, now);
+  } catch {
+    // Best-effort — failure to touch doesn't affect correctness
   }
 }
 
