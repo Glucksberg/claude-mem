@@ -3,8 +3,7 @@
  * Extracted from SessionStore.ts for modular organization
  */
 
-import { createHash } from 'crypto';
-import { Database } from 'bun:sqlite';
+import { Database } from '../sqlite-compat.js';
 import { logger } from '../../../utils/logger.js';
 import { getCurrentProjectName } from '../../../shared/paths.js';
 import type { ObservationInput, StoreObservationResult } from './types.js';
