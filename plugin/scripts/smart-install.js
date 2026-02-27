@@ -15,22 +15,9 @@ import { join, isAbsolute } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
-// Early exit if plugin is disabled in Claude Code settings (#781)
-function isPluginDisabledInClaudeSettings() {
-  try {
-    const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
-    const settingsPath = join(configDir, 'settings.json');
-    if (!existsSync(settingsPath)) return false;
-    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    return settings?.enabledPlugins?.['claude-mem@thedotmack'] === false;
-  } catch {
-    return false;
-  }
-}
-
-if (isPluginDisabledInClaudeSettings()) {
-  process.exit(0);
-}
+const CLAUDE_CONFIG = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+const ROOT = join(CLAUDE_CONFIG, 'plugins', 'marketplaces', 'thedotmack');
+const MARKER = join(ROOT, '.install-version');
 const IS_WINDOWS = process.platform === 'win32';
 
 // Common installation paths (handles fresh installs before PATH reload)

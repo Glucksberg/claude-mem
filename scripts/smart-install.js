@@ -11,6 +11,9 @@ import { join, isAbsolute } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
+const CLAUDE_CONFIG = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+const ROOT = join(CLAUDE_CONFIG, 'plugins', 'marketplaces', 'thedotmack');
+const MARKER = join(ROOT, '.install-version');
 const IS_WINDOWS = process.platform === 'win32';
 
 /**

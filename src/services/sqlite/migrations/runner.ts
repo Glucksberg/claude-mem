@@ -67,11 +67,21 @@ export class MigrationRunner {
         status TEXT CHECK(status IN ('active', 'completed', 'failed')) NOT NULL DEFAULT 'active'
       );
 
-      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_claude_id ON sdk_sessions(content_session_id);
-      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_sdk_id ON sdk_sessions(memory_session_id);
-      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_project ON sdk_sessions(project);
-      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_status ON sdk_sessions(status);
-      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_started ON sdk_sessions(started_at_epoch DESC);
+    // Run migration004 if not yet applied OR if core tables are missing (Issue #979)
+    // Check for table existence to handle databases that have schema_versions
+    // but are missing core tables (e.g., from interrupted migrations or version mismatches)
+    const migration4Applied = appliedVersions.some(v => v.version === 4);
+    const tablesExist = (() => {
+      try {
+        const tables = this.db.prepare(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('sdk_sessions', 'observations', 'session_summaries')"
+        ).all() as { name: string }[];
+        return tables.length === 3;
+      } catch { return false; }
+    })();
+
+    if (!migration4Applied || !tablesExist) {
+      logger.info('DB', 'Running migration004 (core tables)', { migration4Applied, tablesExist });
 
       CREATE TABLE IF NOT EXISTS observations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,8 +121,33 @@ export class MigrationRunner {
       CREATE INDEX IF NOT EXISTS idx_session_summaries_created ON session_summaries(created_at_epoch DESC);
     `);
 
-    // Record migration004 as applied (OR IGNORE handles re-runs safely)
-    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(4, new Date().toISOString());
+        CREATE TABLE IF NOT EXISTS session_summaries (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          memory_session_id TEXT UNIQUE NOT NULL,
+          project TEXT NOT NULL,
+          request TEXT,
+          investigated TEXT,
+          learned TEXT,
+          completed TEXT,
+          next_steps TEXT,
+          files_read TEXT,
+          files_edited TEXT,
+          notes TEXT,
+          created_at TEXT NOT NULL,
+          created_at_epoch INTEGER NOT NULL,
+          FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_summaries_sdk_session ON session_summaries(memory_session_id);
+        CREATE INDEX IF NOT EXISTS idx_session_summaries_project ON session_summaries(project);
+        CREATE INDEX IF NOT EXISTS idx_session_summaries_created ON session_summaries(created_at_epoch DESC);
+      `);
+
+      // Record migration004 as applied (INSERT OR IGNORE for idempotency)
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(4, new Date().toISOString());
+
+      logger.info('DB', 'Migration004 applied successfully');
+    }
   }
 
   /**

@@ -130,22 +130,21 @@ export async function httpShutdown(port: number): Promise<boolean> {
 /**
  * Get the plugin version from the installed marketplace package.json
  * This is the "expected" version that should be running
- *
- * @returns Plugin version string, or '0.0.0-unknown' if package.json cannot be read
+ * Returns 'unknown' if package.json cannot be read (e.g., during shutdown race, file locked)
+ * (Issue #1042)
  */
 export function getInstalledPluginVersion(): string {
+  const packageJsonPath = path.join(MARKETPLACE_ROOT, 'package.json');
   try {
-    const marketplaceRoot = path.join(homedir(), '.claude', 'plugins', 'marketplaces', 'thedotmack');
-    const packageJsonPath = path.join(marketplaceRoot, 'package.json');
     const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
     return packageJson.version;
   } catch (error) {
-    // Graceful fallback: return unknown version instead of crashing
-    // This prevents Stop hook failures during plugin updates or temporary file access issues
-    logger.warn('SYSTEM', 'Could not read installed plugin version from package.json', {
-      error: error instanceof Error ? error.message : String(error)
-    });
-    return '0.0.0-unknown';
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'EBUSY') {
+      logger.debug('SYSTEM', 'Could not read plugin version (shutdown race)', { code });
+      return 'unknown';
+    }
+    throw error;
   }
 }
 

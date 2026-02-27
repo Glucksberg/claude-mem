@@ -239,12 +239,6 @@ export class SessionRoutes extends BaseRouteHandler {
         }
       })
       .finally(async () => {
-        // CRITICAL: Verify subprocess exit to prevent zombie accumulation (Issue #1168)
-        const tracked = getProcessBySession(session.sessionDbId);
-        if (tracked && !tracked.process.killed && tracked.process.exitCode === null) {
-          await ensureProcessExit(tracked, 5000);
-        }
-
         const sessionDbId = session.sessionDbId;
         this.spawnInProgress.delete(sessionDbId);
         const wasAborted = session.abortController.signal.aborted;
@@ -317,11 +311,23 @@ export class SessionRoutes extends BaseRouteHandler {
                 }
               }, backoffMs);
             } else {
-              // No pending work - abort to kill the child process
+              // No pending work - abort and verify subprocess exit (Issues #1010, #1068, #1089, #1090)
               session.abortController.abort();
               // Reset restart counter on successful completion
               session.consecutiveRestarts = 0;
-              logger.debug('SESSION', 'Aborted controller after natural completion', {
+
+              // Verify subprocess actually exits (abort alone is fire-and-forget)
+              const { getProcessBySession, ensureProcessExit } = await import('../../ProcessRegistry.js');
+              const tracked = getProcessBySession(sessionDbId);
+              if (tracked && !tracked.process.killed && tracked.process.exitCode === null) {
+                logger.debug('SESSION', 'Ensuring subprocess exit after natural completion', {
+                  sessionId: sessionDbId,
+                  pid: tracked.pid
+                });
+                await ensureProcessExit(tracked, 5000);
+              }
+
+              logger.debug('SESSION', 'Aborted controller and verified process exit after natural completion', {
                 sessionId: sessionDbId
               });
             }
@@ -561,9 +567,9 @@ export class SessionRoutes extends BaseRouteHandler {
     try {
       const store = this.dbManager.getSessionStore();
 
-      // Get or create session
-      const sessionDbId = store.createSDKSession(contentSessionId, '', '');
-      const promptNumber = store.getPromptNumberFromUserPrompts(contentSessionId);
+    // Get or create session (Issue #1046: use cwd as project fallback to prevent empty project race)
+    const sessionDbId = store.createSDKSession(contentSessionId, cwd || '', '');
+    const promptNumber = store.getPromptNumberFromUserPrompts(contentSessionId);
 
       // Privacy check: skip if user prompt was entirely private
       const userPrompt = PrivacyCheckValidator.checkUserPromptPrivacy(

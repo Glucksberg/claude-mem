@@ -16,7 +16,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { getWorkerPort, getWorkerHost } from '../shared/worker-utils.js';
 import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
-import { getAuthMethodDescription, checkOAuthTokenStatus } from '../shared/EnvManager.js';
+import { getAuthMethodDescription, resolveNodePath, resolveRuntimeBinDir } from '../shared/EnvManager.js';
 import { logger } from '../utils/logger.js';
 import { acquireSpawnLock } from './infrastructure/singleton-manager.js';
 
@@ -178,7 +178,12 @@ import { FeedRoutes } from './worker/http/routes/FeedRoutes.js';
 import { FeedDaemon } from './feed/FeedDaemon.js';
 
 // Process management for zombie cleanup (Issue #737)
-import { startOrphanReaper, reapOrphanedProcesses, getProcessBySession, ensureProcessExit } from './worker/ProcessRegistry.js';
+import { startOrphanReaper, reapOrphanedProcesses, getActiveProcesses } from './worker/ProcessRegistry.js';
+
+// Resource monitoring for token/memory leak detection
+import { startResourceMonitor } from './infrastructure/ResourceMonitor.js';
+import type { SessionTokenSnapshot } from './infrastructure/ResourceMonitor.js';
+import type { ActiveSession } from './worker-types.js';
 
 /**
  * Build JSON status output for hook framework communication.
@@ -242,8 +247,11 @@ export class WorkerService {
   // Orphan reaper cleanup function (Issue #737)
   private stopOrphanReaper: (() => void) | null = null;
 
-  // Stale session reaper interval (Issue #1168)
-  private staleSessionReaperInterval: ReturnType<typeof setInterval> | null = null;
+  // Periodic stuck message recovery (Issues #1036, #1052)
+  private stuckMessageRecoveryInterval: ReturnType<typeof setInterval> | null = null;
+
+  // Resource monitor for token/memory leak detection
+  private stopResourceMonitor: (() => void) | null = null;
 
   // AI interaction tracking for health endpoint
   private lastAiInteraction: {
@@ -540,37 +548,50 @@ export class WorkerService {
       this.server.registerRoutes(this.searchRoutes);
       logger.info('WORKER', 'SearchManager initialized and search routes registered');
 
-      // DB and search are ready — mark initialization complete so hooks can proceed.
-      // MCP connection is tracked separately via mcpReady and is NOT required for
-      // the worker to serve context/search requests.
+      // Mark core initialization complete BEFORE MCP connection
+      // MCP is optional (vector search) and should not block core functionality
       this.initializationCompleteFlag = true;
       this.resolveInitialization();
-      logger.info('SYSTEM', 'Core initialization complete (DB + search ready)');
+      logger.info('SYSTEM', 'Core initialization complete (MCP connecting in background)');
 
-      // Auto-backfill Chroma for all projects if out of sync with SQLite (fire-and-forget)
-      if (this.chromaMcpManager) {
-        ChromaSync.backfillAllProjects().then(() => {
-          logger.info('CHROMA_SYNC', 'Backfill check complete for all projects');
-        }).catch(error => {
-          logger.error('CHROMA_SYNC', 'Backfill failed (non-blocking)', {}, error as Error);
-        });
-      }
-
-      // Connect to MCP server
+      // Connect to MCP server (non-blocking — failure only disables vector search)
+      // Use resolved node path to work around Bun snap PATH restriction
       const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
+      const nodeCommand = resolveNodePath();
+      const binDir = resolveRuntimeBinDir();
+      const realHome = process.env.REAL_HOME || process.env.HOME?.replace(/\/snap\/bun-js\/\d+$/, '') || require('os').homedir();
+      const localBin = path.join(realHome, '.local', 'bin');
+      const extraDirs = [binDir, existsSync(localBin) ? localBin : null].filter(Boolean) as string[];
+      const currentPath = process.env.PATH || '';
+      const missingDirs = extraDirs.filter(d => !currentPath.split(':').includes(d));
+      const mcpEnv = missingDirs.length > 0
+        ? { ...process.env, PATH: [...missingDirs, currentPath].filter(Boolean).join(':') }
+        : { ...process.env };
       const transport = new StdioClientTransport({
-        command: 'node',
+        command: nodeCommand,
         args: [mcpServerPath],
-        env: process.env
+        env: mcpEnv
       });
 
-      await withTimeout(
-        this.mcpClient.connect(transport),
-        300000,
-        'MCP connection'
-      );
-      this.mcpReady = true;
-      logger.success('WORKER', 'MCP server connected');
+      const MCP_INIT_TIMEOUT_MS = 60000; // 60s timeout (was 5 min — too long)
+      const mcpConnectionPromise = this.mcpClient.connect(transport);
+      let timeoutId: ReturnType<typeof setTimeout>;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('MCP connection timeout after 60s')), MCP_INIT_TIMEOUT_MS);
+      });
+
+      Promise.race([mcpConnectionPromise, timeoutPromise])
+        .then(() => {
+          clearTimeout(timeoutId);
+          this.mcpReady = true;
+          logger.success('WORKER', 'Connected to MCP server');
+        })
+        .catch((error) => {
+          clearTimeout(timeoutId);
+          logger.warn('WORKER', 'MCP connection failed (vector search unavailable)', {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        });
 
       // Start orphan reaper to clean up zombie processes (Issue #737)
       this.stopOrphanReaper = startOrphanReaper(() => {
@@ -582,22 +603,28 @@ export class WorkerService {
       });
       logger.info('SYSTEM', 'Started orphan reaper (runs every 5 minutes)');
 
-      // Reap stale sessions to unblock orphan process cleanup (Issue #1168)
-      this.staleSessionReaperInterval = setInterval(async () => {
+      // Start periodic stuck message recovery (Issues #1036, #1052)
+      // Resets messages stuck in 'processing' for >5 minutes back to 'pending'
+      this.stuckMessageRecoveryInterval = setInterval(() => {
         try {
-          const reaped = await this.sessionManager.reapStaleSessions();
-          if (reaped > 0) {
-            logger.info('SYSTEM', `Reaped ${reaped} stale sessions`);
+          const resetCount = pendingStore.resetStaleProcessingMessages(5 * 60 * 1000);
+          if (resetCount > 0) {
+            logger.warn('QUEUE', `Runtime recovery: Reset ${resetCount} stuck processing messages`, {
+              thresholdMinutes: 5
+            });
           }
-        } catch (e) {
-          logger.error('SYSTEM', 'Stale session reaper error', { error: e instanceof Error ? e.message : String(e) });
+        } catch (error) {
+          logger.error('QUEUE', 'Failed to reset stuck messages during periodic recovery', {}, error as Error);
         }
-      }, 2 * 60 * 1000);
+      }, 60 * 1000);
+      logger.info('SYSTEM', 'Started periodic stuck message recovery (every 60s, threshold 5min)');
 
-      // Auto-start feed daemon if configured
-      if (this.feedDaemon.start(this.sseBroadcaster)) {
-        logger.info('SYSTEM', 'Feed daemon auto-started');
-      }
+      // Start resource monitor for token/memory leak detection
+      this.stopResourceMonitor = startResourceMonitor(
+        () => this.getSessionTokenSnapshots(),
+        () => getActiveProcesses().length
+      );
+      logger.info('SYSTEM', 'Started resource monitor (samples every 30s)');
 
       // Auto-recover orphaned queues (fire-and-forget with error logging)
       this.processPendingQueues(50).then(result => {
@@ -978,8 +1005,17 @@ export class WorkerService {
    * Shutdown the worker service
    */
   async shutdown(): Promise<void> {
-    // Stop feed daemon before shutdown
-    this.feedDaemon.stop();
+    // Stop periodic stuck message recovery (Issues #1036, #1052)
+    if (this.stuckMessageRecoveryInterval) {
+      clearInterval(this.stuckMessageRecoveryInterval);
+      this.stuckMessageRecoveryInterval = null;
+    }
+
+    // Stop resource monitor
+    if (this.stopResourceMonitor) {
+      this.stopResourceMonitor();
+      this.stopResourceMonitor = null;
+    }
 
     // Stop orphan reaper before shutdown (Issue #737)
     if (this.stopOrphanReaper) {
@@ -1005,6 +1041,27 @@ export class WorkerService {
   /**
    * Broadcast processing status change to SSE clients
    */
+  /**
+   * Get token snapshots for all active sessions (used by ResourceMonitor callback)
+   */
+  private getSessionTokenSnapshots(): SessionTokenSnapshot[] {
+    const result: SessionTokenSnapshot[] = [];
+    for (const [id, session] of this.sessionManager['sessions'] as Map<number, ActiveSession>) {
+      const ageMs = Date.now() - session.startTime;
+      const totalTokens = session.cumulativeInputTokens + session.cumulativeOutputTokens;
+      result.push({
+        sessionDbId: id,
+        project: session.project,
+        inputTokens: session.cumulativeInputTokens,
+        outputTokens: session.cumulativeOutputTokens,
+        totalTokens,
+        ageMs,
+        tokensPerMinute: ageMs > 0 ? totalTokens / (ageMs / 60000) : 0
+      });
+    }
+    return result;
+  }
+
   broadcastProcessingStatus(): void {
     const isProcessing = this.sessionManager.isAnySessionProcessing();
     const queueDepth = this.sessionManager.getTotalActiveWork();
