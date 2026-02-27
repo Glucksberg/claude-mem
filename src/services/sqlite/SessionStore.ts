@@ -13,7 +13,7 @@ import {
   LatestPromptResult
 } from '../../types/database.js';
 import type { PendingMessageStore } from './PendingMessageStore.js';
-import { computeObservationContentHash, findDuplicateObservation } from './observations/store.js';
+import type { ThoughtInput, Thought } from './thoughts/types.js';
 
 /**
  * Session data store for SDK sessions, observations, and summaries
@@ -49,8 +49,7 @@ export class SessionStore {
     this.repairSessionIdColumnRename();
     this.addFailedAtEpochColumn();
     this.addOnUpdateCascadeToForeignKeys();
-    this.addObservationContentHashColumn();
-    this.addSessionCustomTitleColumn();
+    this.createThoughtsTable();
   }
 
   /**
@@ -836,41 +835,75 @@ export class SessionStore {
   }
 
   /**
-   * Add content_hash column to observations for deduplication (migration 22)
+   * Create thoughts table with FTS5 search (migration 22)
+   * Stores extracted thinking blocks from Claude Code session transcripts
    */
-  private addObservationContentHashColumn(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(22) as SchemaVersion | undefined;
-    if (applied) return;
-
-    const tableInfo = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
-    const hasColumn = tableInfo.some(col => col.name === 'content_hash');
-
-    if (!hasColumn) {
-      this.db.run('ALTER TABLE observations ADD COLUMN content_hash TEXT');
-      this.db.run("UPDATE observations SET content_hash = substr(hex(randomblob(8)), 1, 16) WHERE content_hash IS NULL");
-      this.db.run('CREATE INDEX IF NOT EXISTS idx_observations_content_hash ON observations(content_hash, created_at_epoch)');
-      logger.debug('DB', 'Added content_hash column to observations table with backfill and index');
+  private createThoughtsTable(): void {
+    // Check table existence directly (handles case where schema_versions is marked but table is missing)
+    const tables = this.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='thoughts'").all() as { name: string }[];
+    if (tables.length > 0) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(22, new Date().toISOString());
+      return;
     }
+
+    logger.debug('DB', 'Creating thoughts table with FTS5 support');
+
+    this.db.run(`
+      CREATE TABLE thoughts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_session_id TEXT NOT NULL,
+        content_session_id TEXT,
+        project TEXT NOT NULL,
+        thinking_text TEXT NOT NULL,
+        thinking_summary TEXT,
+        message_index INTEGER,
+        prompt_number INTEGER,
+        created_at TEXT NOT NULL,
+        created_at_epoch INTEGER NOT NULL
+      )
+    `);
+
+    this.db.run(`
+      CREATE INDEX idx_thoughts_session ON thoughts(memory_session_id);
+      CREATE INDEX idx_thoughts_project ON thoughts(project);
+      CREATE INDEX idx_thoughts_epoch ON thoughts(created_at_epoch);
+    `);
+
+    this.db.run(`
+      CREATE VIRTUAL TABLE thoughts_fts USING fts5(
+        thinking_text,
+        thinking_summary,
+        content='thoughts',
+        content_rowid='id'
+      )
+    `);
+
+    this.db.run(`
+      CREATE TRIGGER thoughts_ai AFTER INSERT ON thoughts BEGIN
+        INSERT INTO thoughts_fts(rowid, thinking_text, thinking_summary)
+        VALUES (new.id, new.thinking_text, new.thinking_summary);
+      END
+    `);
+
+    this.db.run(`
+      CREATE TRIGGER thoughts_ad AFTER DELETE ON thoughts BEGIN
+        INSERT INTO thoughts_fts(thoughts_fts, rowid, thinking_text, thinking_summary)
+        VALUES('delete', old.id, old.thinking_text, old.thinking_summary);
+      END
+    `);
+
+    this.db.run(`
+      CREATE TRIGGER thoughts_au AFTER UPDATE ON thoughts BEGIN
+        INSERT INTO thoughts_fts(thoughts_fts, rowid, thinking_text, thinking_summary)
+        VALUES('delete', old.id, old.thinking_text, old.thinking_summary);
+        INSERT INTO thoughts_fts(rowid, thinking_text, thinking_summary)
+        VALUES (new.id, new.thinking_text, new.thinking_summary);
+      END
+    `);
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(22, new Date().toISOString());
-  }
 
-  /**
-   * Add custom_title column to sdk_sessions for agent attribution (migration 23)
-   */
-  private addSessionCustomTitleColumn(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(23) as SchemaVersion | undefined;
-    if (applied) return;
-
-    const tableInfo = this.db.query('PRAGMA table_info(sdk_sessions)').all() as TableColumnInfo[];
-    const hasColumn = tableInfo.some(col => col.name === 'custom_title');
-
-    if (!hasColumn) {
-      this.db.run('ALTER TABLE sdk_sessions ADD COLUMN custom_title TEXT');
-      logger.debug('DB', 'Added custom_title column to sdk_sessions table');
-    }
-
-    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(23, new Date().toISOString());
+    logger.debug('DB', 'Successfully created thoughts table with FTS5 support');
   }
 
   /**
@@ -2454,5 +2487,100 @@ export class SessionStore {
     );
 
     return { imported: true, id: result.lastInsertRowid as number };
+  }
+
+  // ── Thoughts (thinking block storage) ──────────────────────────
+
+  /**
+   * Store multiple thoughts (thinking blocks) from a transcript
+   */
+  storeThoughts(
+    memorySessionId: string,
+    contentSessionId: string | null,
+    project: string,
+    thoughts: ThoughtInput[],
+    promptNumber: number | null
+  ): number[] {
+    const stmt = this.db.prepare(`
+      INSERT INTO thoughts
+      (memory_session_id, content_session_id, project, thinking_text, thinking_summary,
+       message_index, prompt_number, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const ids: number[] = [];
+    for (const thought of thoughts) {
+      const result = stmt.run(
+        memorySessionId,
+        contentSessionId,
+        project,
+        thought.thinking_text,
+        thought.thinking_summary,
+        thought.message_index,
+        promptNumber,
+        new Date().toISOString(),
+        Date.now()
+      );
+      ids.push(Number(result.lastInsertRowid));
+    }
+    return ids;
+  }
+
+  /**
+   * Get thoughts for a project with optional time range and limit
+   */
+  getThoughts(
+    project: string,
+    options?: { limit?: number; startEpoch?: number; endEpoch?: number }
+  ): Thought[] {
+    const params: (string | number)[] = [project];
+    let query = 'SELECT * FROM thoughts WHERE project = ?';
+
+    if (options?.startEpoch != null) {
+      query += ' AND created_at_epoch >= ?';
+      params.push(options.startEpoch);
+    }
+    if (options?.endEpoch != null) {
+      query += ' AND created_at_epoch <= ?';
+      params.push(options.endEpoch);
+    }
+
+    query += ' ORDER BY created_at_epoch DESC';
+
+    if (options?.limit != null) {
+      query += ' LIMIT ?';
+      params.push(options.limit);
+    }
+
+    return this.db.prepare(query).all(...params) as Thought[];
+  }
+
+  /**
+   * Get thoughts by their IDs
+   */
+  getThoughtsByIds(ids: number[]): Thought[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    return this.db.prepare(
+      `SELECT * FROM thoughts WHERE id IN (${placeholders})`
+    ).all(...ids) as Thought[];
+  }
+
+  /**
+   * Full-text search over thinking content using FTS5
+   */
+  searchThoughts(query: string, project?: string, limit: number = 50): Thought[] {
+    const params: (string | number)[] = [query];
+    let sql = `SELECT t.* FROM thoughts t JOIN thoughts_fts f ON t.id = f.rowid WHERE thoughts_fts MATCH ?`;
+
+    if (project != null) {
+      sql += ' AND t.project = ?';
+      params.push(project);
+    }
+
+    sql += ' ORDER BY rank LIMIT ?';
+    params.push(limit);
+
+    return this.db.prepare(sql).all(...params) as Thought[];
   }
 }

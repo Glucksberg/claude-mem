@@ -31,10 +31,7 @@ export class MigrationRunner {
     this.renameSessionIdColumns();
     this.repairSessionIdColumnRename();
     this.addFailedAtEpochColumn();
-    this.addOnUpdateCascadeToForeignKeys();
-    this.addObservationContentHashColumn();
-    this.addSessionCustomTitleColumn();
-    this.addTemporalScoringColumns();
+    this.createThoughtsTable();
   }
 
   /**
@@ -665,229 +662,72 @@ export class MigrationRunner {
   }
 
   /**
-   * Add ON UPDATE CASCADE to FK constraints on observations and session_summaries (migration 21)
-   *
-   * Both tables have FK(memory_session_id) -> sdk_sessions(memory_session_id) with ON DELETE CASCADE
-   * but missing ON UPDATE CASCADE. This causes FK constraint violations when code updates
-   * sdk_sessions.memory_session_id while child rows still reference the old value.
-   *
-   * SQLite doesn't support ALTER TABLE for FK changes, so we recreate both tables.
+   * Create thoughts table with FTS5 search (migration 22)
+   * Stores extracted thinking blocks from Claude Code session transcripts
    */
-  private addOnUpdateCascadeToForeignKeys(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(21) as SchemaVersion | undefined;
-    if (applied) return;
-
-    logger.debug('DB', 'Adding ON UPDATE CASCADE to FK constraints on observations and session_summaries');
-
-    // PRAGMA foreign_keys must be set outside a transaction
-    this.db.run('PRAGMA foreign_keys = OFF');
-    this.db.run('BEGIN TRANSACTION');
-
-    try {
-      // ==========================================
-      // 1. Recreate observations table
-      // ==========================================
-
-      // Drop FTS triggers first (they reference the observations table)
-      this.db.run('DROP TRIGGER IF EXISTS observations_ai');
-      this.db.run('DROP TRIGGER IF EXISTS observations_ad');
-      this.db.run('DROP TRIGGER IF EXISTS observations_au');
-
-      // Clean up leftover temp table from a previously-crashed run
-      this.db.run('DROP TABLE IF EXISTS observations_new');
-
-      this.db.run(`
-        CREATE TABLE observations_new (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          memory_session_id TEXT NOT NULL,
-          project TEXT NOT NULL,
-          text TEXT,
-          type TEXT NOT NULL,
-          title TEXT,
-          subtitle TEXT,
-          facts TEXT,
-          narrative TEXT,
-          concepts TEXT,
-          files_read TEXT,
-          files_modified TEXT,
-          prompt_number INTEGER,
-          discovery_tokens INTEGER DEFAULT 0,
-          created_at TEXT NOT NULL,
-          created_at_epoch INTEGER NOT NULL,
-          FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE ON UPDATE CASCADE
-        )
-      `);
-
-      this.db.run(`
-        INSERT INTO observations_new
-        SELECT id, memory_session_id, project, text, type, title, subtitle, facts,
-               narrative, concepts, files_read, files_modified, prompt_number,
-               discovery_tokens, created_at, created_at_epoch
-        FROM observations
-      `);
-
-      this.db.run('DROP TABLE observations');
-      this.db.run('ALTER TABLE observations_new RENAME TO observations');
-
-      // Recreate indexes
-      this.db.run(`
-        CREATE INDEX idx_observations_sdk_session ON observations(memory_session_id);
-        CREATE INDEX idx_observations_project ON observations(project);
-        CREATE INDEX idx_observations_type ON observations(type);
-        CREATE INDEX idx_observations_created ON observations(created_at_epoch DESC);
-      `);
-
-      // Recreate FTS triggers only if observations_fts exists
-      const hasFTS = (this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='observations_fts'").all() as { name: string }[]).length > 0;
-      if (hasFTS) {
-        this.db.run(`
-          CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations BEGIN
-            INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
-            VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
-          END;
-
-          CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations BEGIN
-            INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts)
-            VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
-          END;
-
-          CREATE TRIGGER IF NOT EXISTS observations_au AFTER UPDATE ON observations BEGIN
-            INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts)
-            VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
-            INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
-            VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
-          END;
-        `);
-      }
-
-      // ==========================================
-      // 2. Recreate session_summaries table
-      // ==========================================
-
-      // Clean up leftover temp table from a previously-crashed run
-      this.db.run('DROP TABLE IF EXISTS session_summaries_new');
-
-      this.db.run(`
-        CREATE TABLE session_summaries_new (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          memory_session_id TEXT NOT NULL,
-          project TEXT NOT NULL,
-          request TEXT,
-          investigated TEXT,
-          learned TEXT,
-          completed TEXT,
-          next_steps TEXT,
-          files_read TEXT,
-          files_edited TEXT,
-          notes TEXT,
-          prompt_number INTEGER,
-          discovery_tokens INTEGER DEFAULT 0,
-          created_at TEXT NOT NULL,
-          created_at_epoch INTEGER NOT NULL,
-          FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE ON UPDATE CASCADE
-        )
-      `);
-
-      this.db.run(`
-        INSERT INTO session_summaries_new
-        SELECT id, memory_session_id, project, request, investigated, learned,
-               completed, next_steps, files_read, files_edited, notes,
-               prompt_number, discovery_tokens, created_at, created_at_epoch
-        FROM session_summaries
-      `);
-
-      // Drop session_summaries FTS triggers before dropping the table
-      this.db.run('DROP TRIGGER IF EXISTS session_summaries_ai');
-      this.db.run('DROP TRIGGER IF EXISTS session_summaries_ad');
-      this.db.run('DROP TRIGGER IF EXISTS session_summaries_au');
-
-      this.db.run('DROP TABLE session_summaries');
-      this.db.run('ALTER TABLE session_summaries_new RENAME TO session_summaries');
-
-      // Recreate indexes
-      this.db.run(`
-        CREATE INDEX idx_session_summaries_sdk_session ON session_summaries(memory_session_id);
-        CREATE INDEX idx_session_summaries_project ON session_summaries(project);
-        CREATE INDEX idx_session_summaries_created ON session_summaries(created_at_epoch DESC);
-      `);
-
-      // Recreate session_summaries FTS triggers if FTS table exists
-      const hasSummariesFTS = (this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='session_summaries_fts'").all() as { name: string }[]).length > 0;
-      if (hasSummariesFTS) {
-        this.db.run(`
-          CREATE TRIGGER IF NOT EXISTS session_summaries_ai AFTER INSERT ON session_summaries BEGIN
-            INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
-            VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
-          END;
-
-          CREATE TRIGGER IF NOT EXISTS session_summaries_ad AFTER DELETE ON session_summaries BEGIN
-            INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes)
-            VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
-          END;
-
-          CREATE TRIGGER IF NOT EXISTS session_summaries_au AFTER UPDATE ON session_summaries BEGIN
-            INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes)
-            VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
-            INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
-            VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
-          END;
-        `);
-      }
-
-      // Record migration
-      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(21, new Date().toISOString());
-
-      this.db.run('COMMIT');
-      this.db.run('PRAGMA foreign_keys = ON');
-
-      logger.debug('DB', 'Successfully added ON UPDATE CASCADE to FK constraints');
-    } catch (error) {
-      this.db.run('ROLLBACK');
-      this.db.run('PRAGMA foreign_keys = ON');
-      throw error;
-    }
-  }
-
-  /**
-   * Add content_hash column to observations for deduplication (migration 22)
-   * Prevents duplicate observations from being stored when the same content is processed multiple times.
-   * Backfills existing rows with unique random hashes so they don't block new inserts.
-   */
-  private addObservationContentHashColumn(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(22) as SchemaVersion | undefined;
-    if (applied) return;
-
-    const tableInfo = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
-    const hasColumn = tableInfo.some(col => col.name === 'content_hash');
-
-    if (!hasColumn) {
-      this.db.run('ALTER TABLE observations ADD COLUMN content_hash TEXT');
-      // Backfill existing rows with unique random hashes
-      this.db.run("UPDATE observations SET content_hash = substr(hex(randomblob(8)), 1, 16) WHERE content_hash IS NULL");
-      // Index for fast dedup lookups
-      this.db.run('CREATE INDEX IF NOT EXISTS idx_observations_content_hash ON observations(content_hash, created_at_epoch)');
-      logger.debug('DB', 'Added content_hash column to observations table with backfill and index');
+  private createThoughtsTable(): void {
+    // Check if table already exists (handles case where schema_versions is marked but table is missing)
+    const tables = this.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='thoughts'").all() as TableNameRow[];
+    if (tables.length > 0) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(22, new Date().toISOString());
+      return;
     }
 
+    logger.debug('DB', 'Creating thoughts table with FTS5 support');
+
+    // Create thoughts table
+    this.db.run(`
+      CREATE TABLE thoughts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_session_id TEXT NOT NULL,
+        content_session_id TEXT,
+        project TEXT NOT NULL,
+        thinking_text TEXT NOT NULL,
+        thinking_summary TEXT,
+        message_index INTEGER,
+        prompt_number INTEGER,
+        created_at TEXT NOT NULL,
+        created_at_epoch INTEGER NOT NULL
+      );
+
+      CREATE INDEX idx_thoughts_session ON thoughts(memory_session_id);
+      CREATE INDEX idx_thoughts_project ON thoughts(project);
+      CREATE INDEX idx_thoughts_epoch ON thoughts(created_at_epoch);
+    `);
+
+    // Create FTS5 virtual table
+    this.db.run(`
+      CREATE VIRTUAL TABLE thoughts_fts USING fts5(
+        thinking_text,
+        thinking_summary,
+        content='thoughts',
+        content_rowid='id'
+      );
+    `);
+
+    // Create triggers to sync FTS5
+    this.db.run(`
+      CREATE TRIGGER thoughts_ai AFTER INSERT ON thoughts BEGIN
+        INSERT INTO thoughts_fts(rowid, thinking_text, thinking_summary)
+        VALUES (new.id, new.thinking_text, new.thinking_summary);
+      END;
+
+      CREATE TRIGGER thoughts_ad AFTER DELETE ON thoughts BEGIN
+        INSERT INTO thoughts_fts(thoughts_fts, rowid, thinking_text, thinking_summary)
+        VALUES('delete', old.id, old.thinking_text, old.thinking_summary);
+      END;
+
+      CREATE TRIGGER thoughts_au AFTER UPDATE ON thoughts BEGIN
+        INSERT INTO thoughts_fts(thoughts_fts, rowid, thinking_text, thinking_summary)
+        VALUES('delete', old.id, old.thinking_text, old.thinking_summary);
+        INSERT INTO thoughts_fts(rowid, thinking_text, thinking_summary)
+        VALUES (new.id, new.thinking_text, new.thinking_summary);
+      END;
+    `);
+
+    // Record migration
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(22, new Date().toISOString());
-  }
 
-  /**
-   * Add custom_title column to sdk_sessions for agent attribution (migration 23)
-   * Allows callers (e.g. Maestro agents) to label sessions with a human-readable name.
-   */
-  private addSessionCustomTitleColumn(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(23) as SchemaVersion | undefined;
-    if (applied) return;
-
-    const tableInfo = this.db.query('PRAGMA table_info(sdk_sessions)').all() as TableColumnInfo[];
-    const hasColumn = tableInfo.some(col => col.name === 'custom_title');
-
-    if (!hasColumn) {
-      this.db.run('ALTER TABLE sdk_sessions ADD COLUMN custom_title TEXT');
-      logger.debug('DB', 'Added custom_title column to sdk_sessions table');
-    }
-
-    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(23, new Date().toISOString());
+    logger.debug('DB', 'Successfully created thoughts table with FTS5 support');
   }
 }

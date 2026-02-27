@@ -122,9 +122,14 @@ export class SearchOrchestrator {
       };
     }
 
-    // PATH 3: No Chroma available - use SQLite FTS5 search
-    logger.debug('SEARCH', 'Orchestrator: Chroma not available, using SQLite FTS5', {});
-    return this.sqliteStrategy.search(options);
+    // PATH 3: No Chroma available
+    logger.debug('SEARCH', 'Orchestrator: Chroma not available', {});
+    return {
+      results: { observations: [], sessions: [], prompts: [], thoughts: [] },
+      usedChroma: false,
+      fellBack: false,
+      strategy: 'sqlite'
+    };
   }
 
   /**
@@ -140,7 +145,7 @@ export class SearchOrchestrator {
     // Fallback to SQLite
     const results = this.sqliteStrategy.findByConcept(concept, options);
     return {
-      results: { observations: results, sessions: [], prompts: [] },
+      results: { observations: results, sessions: [], prompts: [], thoughts: [] },
       usedChroma: false,
       fellBack: false,
       strategy: 'sqlite'
@@ -160,7 +165,7 @@ export class SearchOrchestrator {
     // Fallback to SQLite
     const results = this.sqliteStrategy.findByType(type, options);
     return {
-      results: { observations: results, sessions: [], prompts: [] },
+      results: { observations: results, sessions: [], prompts: [], thoughts: [] },
       usedChroma: false,
       fellBack: false,
       strategy: 'sqlite'
@@ -269,7 +274,7 @@ export class SearchOrchestrator {
 
     // Map 'type' param to 'searchType' for API consistency
     if (normalized.type && !normalized.searchType) {
-      if (['observations', 'sessions', 'prompts'].includes(normalized.type)) {
+      if (['observations', 'sessions', 'prompts', 'thoughts'].includes(normalized.type)) {
         normalized.searchType = normalized.type;
         delete normalized.type;
       }
