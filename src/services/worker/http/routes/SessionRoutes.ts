@@ -14,7 +14,7 @@ import { DatabaseManager } from '../../DatabaseManager.js';
 import { SDKAgent } from '../../SDKAgent.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from '../../GeminiAgent.js';
 import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from '../../OpenRouterAgent.js';
-import { OpenAICodexAgent, isOpenAICodexAvailable } from '../../OpenAICodexAgent.js';
+import { CopilotAgent, isCopilotSelected, isCopilotAvailable } from '../../CopilotAgent.js';
 import type { WorkerService } from '../../../worker-service.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { SessionEventBroadcaster } from '../../events/SessionEventBroadcaster.js';
@@ -35,7 +35,7 @@ export class SessionRoutes extends BaseRouteHandler {
     private sdkAgent: SDKAgent,
     private geminiAgent: GeminiAgent,
     private openRouterAgent: OpenRouterAgent,
-    private openAICodexAgent: OpenAICodexAgent,
+    private copilotAgent: CopilotAgent,
     private eventBroadcaster: SessionEventBroadcaster,
     private workerService: WorkerService
   ) {
@@ -53,16 +53,25 @@ export class SessionRoutes extends BaseRouteHandler {
    * Note: Session linking via contentSessionId allows provider switching mid-session.
    * The conversationHistory on ActiveSession maintains context across providers.
    */
-  /**
-   * Resolve which provider string to use for a given session.
-   * If the session originates from OpenClaw (contentSessionId starts with 'openclaw-')
-   * AND CLAUDE_MEM_OPENCLAW_PROVIDER is configured, that takes precedence.
-   * Otherwise falls back to the global CLAUDE_MEM_PROVIDER.
-   */
-  private resolveProviderForSession(contentSessionId?: string): string {
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    if (contentSessionId?.startsWith('openclaw-') && settings.CLAUDE_MEM_OPENCLAW_PROVIDER) {
-      return settings.CLAUDE_MEM_OPENCLAW_PROVIDER;
+  private getActiveAgent(): SDKAgent | GeminiAgent | OpenRouterAgent | CopilotAgent {
+    if (isCopilotSelected()) {
+      if (isCopilotAvailable()) {
+        logger.debug('SESSION', 'Using GitHub Copilot agent');
+        return this.copilotAgent;
+      } else {
+        throw new Error(
+          'GitHub Copilot provider selected but no valid token is available. ' +
+          'If you use OpenClaw, run: openclaw models auth login-github-copilot (TTY required).'
+        );
+      }
+    }
+    if (isOpenRouterSelected()) {
+      if (isOpenRouterAvailable()) {
+        logger.debug('SESSION', 'Using OpenRouter agent');
+        return this.openRouterAgent;
+      } else {
+        throw new Error('OpenRouter provider selected but no API key configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.');
+      }
     }
     return settings.CLAUDE_MEM_PROVIDER || 'claude';
   }
@@ -97,12 +106,14 @@ export class SessionRoutes extends BaseRouteHandler {
   /**
    * Get the currently selected provider name for a session.
    */
-  private getSelectedProvider(contentSessionId?: string): 'claude' | 'gemini' | 'openrouter' | 'openai-codex' {
-    const provider = this.resolveProviderForSession(contentSessionId);
-    if (provider === 'openai-codex' && isOpenAICodexAvailable()) return 'openai-codex';
-    if (provider === 'openrouter' && isOpenRouterAvailable()) return 'openrouter';
-    if (provider === 'gemini' && isGeminiAvailable()) return 'gemini';
-    return 'claude';
+  private getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' | 'github-copilot' {
+    if (isCopilotSelected() && isCopilotAvailable()) {
+      return 'github-copilot';
+    }
+    if (isOpenRouterSelected() && isOpenRouterAvailable()) {
+      return 'openrouter';
+    }
+    return (isGeminiSelected() && isGeminiAvailable()) ? 'gemini' : 'claude';
   }
 
   /**

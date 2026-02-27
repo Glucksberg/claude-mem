@@ -156,7 +156,7 @@ import { SSEBroadcaster } from './worker/SSEBroadcaster.js';
 import { SDKAgent } from './worker/SDKAgent.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from './worker/GeminiAgent.js';
 import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from './worker/OpenRouterAgent.js';
-import { OpenAICodexAgent, isOpenAICodexSelected, isOpenAICodexAvailable } from './worker/OpenAICodexAgent.js';
+import { CopilotAgent, isCopilotSelected, isCopilotAvailable } from './worker/CopilotAgent.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
 import { SettingsManager } from './worker/SettingsManager.js';
 import { SearchManager } from './worker/SearchManager.js';
@@ -224,7 +224,7 @@ export class WorkerService {
   private sdkAgent: SDKAgent;
   private geminiAgent: GeminiAgent;
   private openRouterAgent: OpenRouterAgent;
-  private openAICodexAgent: OpenAICodexAgent;
+  private copilotAgent: CopilotAgent;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
@@ -275,14 +275,12 @@ export class WorkerService {
     this.sdkAgent = new SDKAgent(this.dbManager, this.sessionManager);
     this.geminiAgent = new GeminiAgent(this.dbManager, this.sessionManager);
     this.openRouterAgent = new OpenRouterAgent(this.dbManager, this.sessionManager);
-    this.openAICodexAgent = new OpenAICodexAgent(this.dbManager, this.sessionManager);
+    this.copilotAgent = new CopilotAgent(this.dbManager, this.sessionManager);
 
-    // Configure fallback chain for non-Claude providers.
-    // If provider-specific API calls fail with transient/recoverable errors,
-    // the request can continue via the Claude SDK agent.
+    // Configure fallback: if a REST provider fails, fall back to Claude SDK when appropriate
     this.geminiAgent.setFallbackAgent(this.sdkAgent);
     this.openRouterAgent.setFallbackAgent(this.sdkAgent);
-    this.openAICodexAgent.setFallbackAgent(this.sdkAgent);
+    this.copilotAgent.setFallbackAgent(this.sdkAgent);
 
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
@@ -311,7 +309,8 @@ export class WorkerService {
       workerPath: __filename,
       getAiStatus: () => {
         let provider = 'claude';
-        if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
+        if (isCopilotSelected() && isCopilotAvailable()) provider = 'github-copilot';
+        else if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
         else if (isGeminiSelected() && isGeminiAvailable()) provider = 'gemini';
 
         // Check OAuth token health for proactive monitoring
@@ -438,7 +437,7 @@ export class WorkerService {
 
     // Standard routes (registered AFTER guard middleware)
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this));
+    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.copilotAgent, this.sessionEventBroadcaster, this));
     this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
@@ -687,17 +686,15 @@ export class WorkerService {
    * silently falls back to SDK — used for background startup recovery where
    * throwing would leave pending messages stuck.
    */
-  /**
-   * Resolve the effective provider for a session.
-   * OpenClaw sessions (contentSessionId starts with 'openclaw-') use
-   * CLAUDE_MEM_OPENCLAW_PROVIDER if configured; otherwise fall back to
-   * the global CLAUDE_MEM_PROVIDER.
-   */
-  private resolveProviderForSession(contentSessionId?: string): string {
-    const { USER_SETTINGS_PATH } = require('../shared/paths.js');
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    if (contentSessionId?.startsWith('openclaw-') && settings.CLAUDE_MEM_OPENCLAW_PROVIDER) {
-      return settings.CLAUDE_MEM_OPENCLAW_PROVIDER;
+  private getActiveAgent(): SDKAgent | GeminiAgent | OpenRouterAgent | CopilotAgent {
+    if (isCopilotSelected() && isCopilotAvailable()) {
+      return this.copilotAgent;
+    }
+    if (isOpenRouterSelected() && isOpenRouterAvailable()) {
+      return this.openRouterAgent;
+    }
+    if (isGeminiSelected() && isGeminiAvailable()) {
+      return this.geminiAgent;
     }
     return settings.CLAUDE_MEM_PROVIDER || 'claude';
   }
