@@ -15,6 +15,7 @@ import { SDKAgent } from '../../SDKAgent.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from '../../GeminiAgent.js';
 import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from '../../OpenRouterAgent.js';
 import { OpenAICodexAgent, isOpenAICodexAvailable } from '../../OpenAICodexAgent.js';
+import { MoonshotAgent, isMoonshotSelected, isMoonshotAvailable } from '../../MoonshotAgent.js';
 import type { WorkerService } from '../../../worker-service.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { SessionEventBroadcaster } from '../../events/SessionEventBroadcaster.js';
@@ -36,6 +37,7 @@ export class SessionRoutes extends BaseRouteHandler {
     private geminiAgent: GeminiAgent,
     private openRouterAgent: OpenRouterAgent,
     private openAICodexAgent: OpenAICodexAgent,
+    private moonshotAgent: MoonshotAgent,
     private eventBroadcaster: SessionEventBroadcaster,
     private workerService: WorkerService
   ) {
@@ -67,7 +69,7 @@ export class SessionRoutes extends BaseRouteHandler {
     return settings.CLAUDE_MEM_PROVIDER || 'claude';
   }
 
-  private getActiveAgent(contentSessionId?: string): SDKAgent | GeminiAgent | OpenRouterAgent | OpenAICodexAgent {
+  private getActiveAgent(contentSessionId?: string): SDKAgent | GeminiAgent | OpenRouterAgent | OpenAICodexAgent | MoonshotAgent {
     const provider = this.resolveProviderForSession(contentSessionId);
 
     if (provider === 'openai-codex') {
@@ -91,17 +93,25 @@ export class SessionRoutes extends BaseRouteHandler {
       }
       throw new Error('Gemini provider selected but no API key configured. Set CLAUDE_MEM_GEMINI_API_KEY in settings or GEMINI_API_KEY environment variable.');
     }
+    if (provider === 'moonshot' || provider === 'kimi' || provider === 'moonshot-ai') {
+      if (isMoonshotAvailable()) {
+        logger.debug('SESSION', 'Using Moonshot agent', { contentSessionId });
+        return this.moonshotAgent;
+      }
+      throw new Error('Moonshot provider selected but no API key configured. Set CLAUDE_MEM_MOONSHOT_API_KEY in settings or MOONSHOT_API_KEY environment variable.');
+    }
     return this.sdkAgent;
   }
 
   /**
    * Get the currently selected provider name for a session.
    */
-  private getSelectedProvider(contentSessionId?: string): 'claude' | 'gemini' | 'openrouter' | 'openai-codex' {
+  private getSelectedProvider(contentSessionId?: string): 'claude' | 'gemini' | 'openrouter' | 'openai-codex' | 'moonshot' {
     const provider = this.resolveProviderForSession(contentSessionId);
     if (provider === 'openai-codex' && isOpenAICodexAvailable()) return 'openai-codex';
     if (provider === 'openrouter' && isOpenRouterAvailable()) return 'openrouter';
     if (provider === 'gemini' && isGeminiAvailable()) return 'gemini';
+    if ((provider === 'moonshot' || provider === 'kimi' || provider === 'moonshot-ai') && isMoonshotAvailable()) return 'moonshot';
     return 'claude';
   }
 
@@ -173,7 +183,7 @@ export class SessionRoutes extends BaseRouteHandler {
    */
   private startGeneratorWithProvider(
     session: ReturnType<typeof this.sessionManager.getSession>,
-    provider: 'claude' | 'gemini' | 'openrouter' | 'openai-codex',
+    provider: 'claude' | 'gemini' | 'openrouter' | 'openai-codex' | 'moonshot',
     source: string
   ): void {
     if (!session) return;
@@ -192,6 +202,7 @@ export class SessionRoutes extends BaseRouteHandler {
     // to guarantee session.currentProvider matches the actual agent being used.
     const agent =
       provider === 'openai-codex' ? this.openAICodexAgent :
+      provider === 'moonshot'     ? this.moonshotAgent    :
       provider === 'openrouter'   ? this.openRouterAgent  :
       provider === 'gemini'       ? this.geminiAgent      :
                                     this.sdkAgent;

@@ -109,6 +109,7 @@ import { SDKAgent } from './worker/SDKAgent.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from './worker/GeminiAgent.js';
 import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from './worker/OpenRouterAgent.js';
 import { OpenAICodexAgent, isOpenAICodexSelected, isOpenAICodexAvailable } from './worker/OpenAICodexAgent.js';
+import { MoonshotAgent, isMoonshotSelected, isMoonshotAvailable } from './worker/MoonshotAgent.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
 import { SettingsManager } from './worker/SettingsManager.js';
 import { SearchManager } from './worker/SearchManager.js';
@@ -171,6 +172,7 @@ export class WorkerService {
   private geminiAgent: GeminiAgent;
   private openRouterAgent: OpenRouterAgent;
   private openAICodexAgent: OpenAICodexAgent;
+  private moonshotAgent: MoonshotAgent;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
@@ -213,6 +215,7 @@ export class WorkerService {
     this.geminiAgent = new GeminiAgent(this.dbManager, this.sessionManager);
     this.openRouterAgent = new OpenRouterAgent(this.dbManager, this.sessionManager);
     this.openAICodexAgent = new OpenAICodexAgent(this.dbManager, this.sessionManager);
+    this.moonshotAgent = new MoonshotAgent(this.dbManager, this.sessionManager);
 
     // Configure fallback chain for non-Claude providers.
     // If provider-specific API calls fail with transient/recoverable errors,
@@ -220,6 +223,7 @@ export class WorkerService {
     this.geminiAgent.setFallbackAgent(this.sdkAgent);
     this.openRouterAgent.setFallbackAgent(this.sdkAgent);
     this.openAICodexAgent.setFallbackAgent(this.sdkAgent);
+    this.moonshotAgent.setFallbackAgent(this.sdkAgent);
 
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
@@ -247,7 +251,8 @@ export class WorkerService {
       workerPath: __filename,
       getAiStatus: () => {
         let provider = 'claude';
-        if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
+        if (isMoonshotSelected() && isMoonshotAvailable()) provider = 'moonshot';
+        else if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
         else if (isGeminiSelected() && isGeminiAvailable()) provider = 'gemini';
         return {
           provider,
@@ -348,7 +353,7 @@ export class WorkerService {
 
     // Standard routes (registered AFTER guard middleware)
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.openAICodexAgent, this.sessionEventBroadcaster, this));
+    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.openAICodexAgent, this.moonshotAgent, this.sessionEventBroadcaster, this));
     this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
@@ -533,9 +538,10 @@ export class WorkerService {
     return settings.CLAUDE_MEM_PROVIDER || 'claude';
   }
 
-  private getActiveAgent(contentSessionId?: string): SDKAgent | GeminiAgent | OpenRouterAgent | OpenAICodexAgent {
+  private getActiveAgent(contentSessionId?: string): SDKAgent | GeminiAgent | OpenRouterAgent | OpenAICodexAgent | MoonshotAgent {
     const provider = this.resolveProviderForSession(contentSessionId);
     if (provider === 'openai-codex' && isOpenAICodexAvailable()) return this.openAICodexAgent;
+    if ((provider === 'moonshot' || provider === 'kimi' || provider === 'moonshot-ai') && isMoonshotAvailable()) return this.moonshotAgent;
     if (provider === 'openrouter' && isOpenRouterAvailable()) return this.openRouterAgent;
     if (provider === 'gemini' && isGeminiAvailable()) return this.geminiAgent;
     return this.sdkAgent;
