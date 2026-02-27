@@ -102,14 +102,7 @@ export class ChromaMcpManager {
     const commandArgs = this.buildCommandArgs();
     const spawnEnvironment = this.getSpawnEnv();
 
-    // On Windows, .cmd files require shell resolution. Since MCP SDK's
-    // StdioClientTransport doesn't support `shell: true`, route through
-    // cmd.exe which resolves .cmd/.bat extensions and PATH automatically.
-    // This also fixes Git Bash compatibility (#1062) since cmd.exe handles
-    // Windows-native command resolution regardless of the calling shell.
-    const isWindows = process.platform === 'win32';
-    const uvxSpawnCommand = isWindows ? (process.env.ComSpec || 'cmd.exe') : 'uvx';
-    const uvxSpawnArgs = isWindows ? ['/c', 'uvx', ...commandArgs] : commandArgs;
+    const uvxCommand = 'uvx';
 
     logger.info('CHROMA_MCP', 'Connecting to chroma-mcp via MCP stdio', {
       command: uvxSpawnCommand,
