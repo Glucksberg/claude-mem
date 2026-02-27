@@ -29,8 +29,18 @@ export async function isPortInUse(port: number): Promise<boolean> {
 }
 
 /**
- * Poll a localhost endpoint until it returns 200 OK or timeout.
- * Shared implementation for liveness and readiness checks.
+ * Wait for the worker HTTP server to become responsive (liveness check)
+ * Uses /api/health instead of /api/readiness because:
+ * - /api/health returns 200 as soon as HTTP server is listening
+ * - /api/readiness waits for full initialization (MCP connection can take 5+ minutes)
+ * See: https://github.com/thedotmack/claude-mem/issues/811
+ *
+ * Uses exponential backoff: 200ms → 400ms → 800ms → 1600ms → capped at 2000ms
+ * to reduce wasted fetch requests during long startups.
+ *
+ * @param port Worker port to check
+ * @param timeoutMs Maximum time to wait in milliseconds
+ * @returns true if worker became responsive, false if timeout
  */
 async function pollEndpointUntilOk(
   port: number,
@@ -39,6 +49,9 @@ async function pollEndpointUntilOk(
   retryLogMessage: string
 ): Promise<boolean> {
   const start = Date.now();
+  let delay = 200; // Start with 200ms, backoff to 2s max
+  const MAX_DELAY = 2000;
+
   while (Date.now() - start < timeoutMs) {
     try {
       // Note: Removed AbortSignal.timeout to avoid Windows Bun cleanup issue (libuv assertion)
@@ -46,9 +59,10 @@ async function pollEndpointUntilOk(
       if (response.ok) return true;
     } catch (error) {
       // [ANTI-PATTERN IGNORED]: Retry loop - expected failures during startup, will retry
-      logger.debug('SYSTEM', retryLogMessage, { port }, error as Error);
+      logger.debug('SYSTEM', 'Service not ready yet, will retry', { port, nextDelayMs: delay }, error as Error);
     }
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, delay));
+    delay = Math.min(delay * 2, MAX_DELAY);
   }
   return false;
 }

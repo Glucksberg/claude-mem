@@ -77,12 +77,24 @@ export class ChromaSync {
 
   constructor(project: string) {
     this.project = project;
-    // Chroma collection names only allow [a-zA-Z0-9._-], 3-512 chars,
-    // must start/end with [a-zA-Z0-9]
-    const sanitized = project
-      .replace(/[^a-zA-Z0-9._-]/g, '_')
-      .replace(/[^a-zA-Z0-9]+$/, '');  // strip trailing non-alphanumeric
-    this.collectionName = `cm__${sanitized || 'unknown'}`;
+    this.collectionName = `cm__${project}`;
+    this.VECTOR_DB_DIR = path.join(os.homedir(), '.claude-mem', 'vector-db');
+
+    // Disable on Windows to prevent console popups from MCP subprocess spawning
+    // The MCP SDK's StdioClientTransport spawns Python processes that create visible windows
+    const allowWindowsChroma = process.env.CLAUDE_MEM_ENABLE_CHROMA_WINDOWS === 'true';
+    this.disabled = process.platform === 'win32' && !allowWindowsChroma;
+    if (this.disabled) {
+      logger.warn('CHROMA_SYNC', 'Vector search disabled on Windows (prevents console popups)', {
+        project: this.project,
+        reason: 'MCP SDK subprocess spawning causes visible console windows'
+      });
+    } else if (process.platform === 'win32' && allowWindowsChroma) {
+      logger.warn('CHROMA_SYNC', 'Vector search enabled on Windows by override', {
+        project: this.project,
+        note: 'Console popups may occur when spawning MCP subprocesses'
+      });
+    }
   }
 
   /**
@@ -90,8 +102,94 @@ export class ChromaSync {
    * chroma_create_collection is idempotent - safe to call multiple times.
    * Uses collectionCreated flag to avoid redundant calls within a session.
    */
-  private async ensureCollectionExists(): Promise<void> {
-    if (this.collectionCreated) {
+  private getCombinedCertPath(): string | undefined {
+    const combinedCertPath = path.join(os.homedir(), '.claude-mem', 'combined_certs.pem');
+
+    // If combined certs already exist and are recent (less than 24 hours old), use them
+    if (fs.existsSync(combinedCertPath)) {
+      const stats = fs.statSync(combinedCertPath);
+      const ageMs = Date.now() - stats.mtimeMs;
+      if (ageMs < 24 * 60 * 60 * 1000) {
+        return combinedCertPath;
+      }
+    }
+
+    // Only create on macOS (Zscaler certificate extraction uses macOS security command)
+    if (process.platform !== 'darwin') {
+      return undefined;
+    }
+
+    try {
+      // Use uvx to resolve the correct certifi path for the exact Python environment it uses
+      // This is more reliable than scanning the uv cache directory structure
+      let certifiPath: string | undefined;
+      try {
+        certifiPath = execSync(
+          'uvx --with certifi python -c "import certifi; print(certifi.where())"',
+          { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 }
+        ).trim();
+      } catch {
+        // uvx or certifi not available
+        return undefined;
+      }
+
+      if (!certifiPath || !fs.existsSync(certifiPath)) {
+        return undefined;
+      }
+
+      // Try to extract Zscaler certificate from macOS keychain
+      let zscalerCert = '';
+      try {
+        zscalerCert = execSync(
+          'security find-certificate -a -c "Zscaler" -p /Library/Keychains/System.keychain',
+          { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 }
+        );
+      } catch {
+        // Zscaler not found, which is fine - not all environments have it
+        return undefined;
+      }
+
+      // Validate PEM certificate format (must have both BEGIN and END markers)
+      if (!zscalerCert ||
+          !zscalerCert.includes('-----BEGIN CERTIFICATE-----') ||
+          !zscalerCert.includes('-----END CERTIFICATE-----')) {
+        return undefined;
+      }
+
+      // Create combined certificate bundle with atomic write (write to temp, then rename)
+      const certifiContent = fs.readFileSync(certifiPath, 'utf8');
+      const tempPath = combinedCertPath + '.tmp';
+      fs.writeFileSync(tempPath, certifiContent + '\n' + zscalerCert);
+      fs.renameSync(tempPath, combinedCertPath);
+      logger.info('CHROMA_SYNC', 'Created combined SSL certificate bundle for Zscaler', {
+        path: combinedCertPath
+      });
+
+      return combinedCertPath;
+    } catch (error) {
+      logger.debug('CHROMA_SYNC', 'Could not create combined cert bundle', {}, error as Error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Check if Chroma is disabled (Windows)
+   */
+  isDisabled(): boolean {
+    return this.disabled;
+  }
+
+  /**
+   * Ensure MCP client is connected to Chroma server
+   * Throws error if connection fails
+   * No-op on Windows when disabled (defense-in-depth)
+   */
+  private async ensureConnection(): Promise<void> {
+    if (this.disabled) {
+      throw new Error('Chroma is disabled on this platform');
+    }
+
+    if (this.connected && this.client) {
       return;
     }
 
@@ -116,17 +214,35 @@ export class ChromaSync {
   }
 
   /**
+   * Safely parse a JSON string, returning fallback on failure.
+   * Prevents a single corrupted record from crashing the entire backfill.
+   */
+  private safeJsonParse(value: string | null, fallback: any[] = [], context?: { field: string; obsId: number }): any {
+    if (!value) return fallback;
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      logger.warn('CHROMA_SYNC', 'Corrupted JSON field in observation, skipping', {
+        field: context?.field ?? 'unknown',
+        observationId: context?.obsId ?? 0,
+        preview: value.substring(0, 100)
+      });
+      return fallback;
+    }
+  }
+
+  /**
    * Format observation into Chroma documents (granular approach)
    * Each semantic field becomes a separate vector document
    */
   private formatObservationDocs(obs: StoredObservation): ChromaDocument[] {
     const documents: ChromaDocument[] = [];
 
-    // Parse JSON fields
-    const facts = obs.facts ? JSON.parse(obs.facts) : [];
-    const concepts = obs.concepts ? JSON.parse(obs.concepts) : [];
-    const files_read = obs.files_read ? JSON.parse(obs.files_read) : [];
-    const files_modified = obs.files_modified ? JSON.parse(obs.files_modified) : [];
+    // Parse JSON fields — tolerant of corrupted data
+    const facts = this.safeJsonParse(obs.facts, [], { field: 'facts', obsId: obs.id });
+    const concepts = this.safeJsonParse(obs.concepts, [], { field: 'concepts', obsId: obs.id });
+    const files_read = this.safeJsonParse(obs.files_read, [], { field: 'files_read', obsId: obs.id });
+    const files_modified = this.safeJsonParse(obs.files_modified, [], { field: 'files_modified', obsId: obs.id });
 
     const baseMetadata: Record<string, string | number> = {
       sqlite_id: obs.id,
@@ -509,9 +625,7 @@ export class ChromaSync {
 
   /**
    * Backfill: Sync all observations missing from Chroma
-   * Reads from SQLite and syncs in batches
-   * @param projectOverride - If provided, backfill this project instead of this.project.
-   *   Used by backfillAllProjects() to iterate projects without mutating instance state.
+   * Reads from SQLite in paginated batches to avoid OOM on large datasets
    * Throws error if backfill fails
    */
   async ensureBackfilled(projectOverride?: string): Promise<void> {
@@ -524,6 +638,7 @@ export class ChromaSync {
     const existing = await this.getExistingChromaIds(backfillProject);
 
     const db = new SessionStore();
+    const PAGE_SIZE = 500; // Process 500 rows at a time to limit memory usage
 
     try {
       // Build exclusion list for observations
@@ -533,40 +648,54 @@ export class ChromaSync {
         ? `AND id NOT IN (${existingObsIds.join(',')})`
         : '';
 
-      // Get only observations missing from Chroma
-      const observations = db.db.prepare(`
-        SELECT * FROM observations
-        WHERE project = ? ${obsExclusionClause}
-        ORDER BY id ASC
-      `).all(backfillProject) as StoredObservation[];
-
       const totalObsCount = db.db.prepare(`
         SELECT COUNT(*) as count FROM observations WHERE project = ?
       `).get(backfillProject) as { count: number };
 
-      logger.info('CHROMA_SYNC', 'Backfilling observations', {
-        project: backfillProject,
-        missing: observations.length,
+      // Paginated observation backfill
+      let obsOffset = 0;
+      let totalObsDocs = 0;
+      let totalObsRows = 0;
+
+      while (true) {
+        const observations = db.db.prepare(`
+          SELECT * FROM observations
+          WHERE project = ? ${obsExclusionClause}
+          ORDER BY id ASC
+          LIMIT ? OFFSET ?
+        `).all(this.project, PAGE_SIZE, obsOffset) as StoredObservation[];
+
+        if (observations.length === 0) break;
+        totalObsRows += observations.length;
+
+        // Format observation documents for this page
+        const pageDocs: ChromaDocument[] = [];
+        for (const obs of observations) {
+          pageDocs.push(...this.formatObservationDocs(obs));
+        }
+
+        // Sync page in batches
+        for (let i = 0; i < pageDocs.length; i += this.BATCH_SIZE) {
+          const batch = pageDocs.slice(i, i + this.BATCH_SIZE);
+          await this.addDocuments(batch);
+        }
+
+        totalObsDocs += pageDocs.length;
+        obsOffset += PAGE_SIZE;
+
+        logger.debug('CHROMA_SYNC', 'Observation backfill progress', {
+          project: this.project,
+          rowsProcessed: totalObsRows,
+          docsCreated: totalObsDocs
+        });
+      }
+
+      logger.info('CHROMA_SYNC', 'Backfilled observations', {
+        project: this.project,
+        missing: totalObsRows,
         existing: existing.observations.size,
         total: totalObsCount.count
       });
-
-      // Format all observation documents
-      const allDocs: ChromaDocument[] = [];
-      for (const obs of observations) {
-        allDocs.push(...this.formatObservationDocs(obs));
-      }
-
-      // Sync in batches
-      for (let i = 0; i < allDocs.length; i += this.BATCH_SIZE) {
-        const batch = allDocs.slice(i, i + this.BATCH_SIZE);
-        await this.addDocuments(batch);
-
-        logger.debug('CHROMA_SYNC', 'Backfill progress', {
-          project: backfillProject,
-          progress: `${Math.min(i + this.BATCH_SIZE, allDocs.length)}/${allDocs.length}`
-        });
-      }
 
       // Build exclusion list for summaries
       const existingSummaryIds = Array.from(existing.summaries).filter(id => Number.isInteger(id) && id > 0);
@@ -574,58 +703,52 @@ export class ChromaSync {
         ? `AND id NOT IN (${existingSummaryIds.join(',')})`
         : '';
 
-      // Get only summaries missing from Chroma
-      const summaries = db.db.prepare(`
-        SELECT * FROM session_summaries
-        WHERE project = ? ${summaryExclusionClause}
-        ORDER BY id ASC
-      `).all(backfillProject) as StoredSummary[];
-
       const totalSummaryCount = db.db.prepare(`
         SELECT COUNT(*) as count FROM session_summaries WHERE project = ?
       `).get(backfillProject) as { count: number };
 
-      logger.info('CHROMA_SYNC', 'Backfilling summaries', {
-        project: backfillProject,
-        missing: summaries.length,
+      // Paginated summary backfill
+      let summaryOffset = 0;
+      let totalSummaryDocs = 0;
+      let totalSummaryRows = 0;
+
+      while (true) {
+        const summaries = db.db.prepare(`
+          SELECT * FROM session_summaries
+          WHERE project = ? ${summaryExclusionClause}
+          ORDER BY id ASC
+          LIMIT ? OFFSET ?
+        `).all(this.project, PAGE_SIZE, summaryOffset) as StoredSummary[];
+
+        if (summaries.length === 0) break;
+        totalSummaryRows += summaries.length;
+
+        const pageDocs: ChromaDocument[] = [];
+        for (const summary of summaries) {
+          pageDocs.push(...this.formatSummaryDocs(summary));
+        }
+
+        for (let i = 0; i < pageDocs.length; i += this.BATCH_SIZE) {
+          const batch = pageDocs.slice(i, i + this.BATCH_SIZE);
+          await this.addDocuments(batch);
+        }
+
+        totalSummaryDocs += pageDocs.length;
+        summaryOffset += PAGE_SIZE;
+      }
+
+      logger.info('CHROMA_SYNC', 'Backfilled summaries', {
+        project: this.project,
+        missing: totalSummaryRows,
         existing: existing.summaries.size,
         total: totalSummaryCount.count
       });
-
-      // Format all summary documents
-      const summaryDocs: ChromaDocument[] = [];
-      for (const summary of summaries) {
-        summaryDocs.push(...this.formatSummaryDocs(summary));
-      }
-
-      // Sync in batches
-      for (let i = 0; i < summaryDocs.length; i += this.BATCH_SIZE) {
-        const batch = summaryDocs.slice(i, i + this.BATCH_SIZE);
-        await this.addDocuments(batch);
-
-        logger.debug('CHROMA_SYNC', 'Backfill progress', {
-          project: backfillProject,
-          progress: `${Math.min(i + this.BATCH_SIZE, summaryDocs.length)}/${summaryDocs.length}`
-        });
-      }
 
       // Build exclusion list for prompts
       const existingPromptIds = Array.from(existing.prompts).filter(id => Number.isInteger(id) && id > 0);
       const promptExclusionClause = existingPromptIds.length > 0
         ? `AND up.id NOT IN (${existingPromptIds.join(',')})`
         : '';
-
-      // Get only user prompts missing from Chroma
-      const prompts = db.db.prepare(`
-        SELECT
-          up.*,
-          s.project,
-          s.memory_session_id
-        FROM user_prompts up
-        JOIN sdk_sessions s ON up.content_session_id = s.content_session_id
-        WHERE s.project = ? ${promptExclusionClause}
-        ORDER BY up.id ASC
-      `).all(backfillProject) as StoredUserPrompt[];
 
       const totalPromptCount = db.db.prepare(`
         SELECT COUNT(*) as count
@@ -634,36 +757,54 @@ export class ChromaSync {
         WHERE s.project = ?
       `).get(backfillProject) as { count: number };
 
-      logger.info('CHROMA_SYNC', 'Backfilling user prompts', {
-        project: backfillProject,
-        missing: prompts.length,
+      // Paginated prompt backfill
+      let promptOffset = 0;
+      let totalPromptDocs = 0;
+      let totalPromptRows = 0;
+
+      while (true) {
+        const prompts = db.db.prepare(`
+          SELECT
+            up.*,
+            s.project,
+            s.memory_session_id
+          FROM user_prompts up
+          JOIN sdk_sessions s ON up.content_session_id = s.content_session_id
+          WHERE s.project = ? ${promptExclusionClause}
+          ORDER BY up.id ASC
+          LIMIT ? OFFSET ?
+        `).all(this.project, PAGE_SIZE, promptOffset) as StoredUserPrompt[];
+
+        if (prompts.length === 0) break;
+        totalPromptRows += prompts.length;
+
+        const pageDocs: ChromaDocument[] = [];
+        for (const prompt of prompts) {
+          pageDocs.push(this.formatUserPromptDoc(prompt));
+        }
+
+        for (let i = 0; i < pageDocs.length; i += this.BATCH_SIZE) {
+          const batch = pageDocs.slice(i, i + this.BATCH_SIZE);
+          await this.addDocuments(batch);
+        }
+
+        totalPromptDocs += pageDocs.length;
+        promptOffset += PAGE_SIZE;
+      }
+
+      logger.info('CHROMA_SYNC', 'Backfilled user prompts', {
+        project: this.project,
+        missing: totalPromptRows,
         existing: existing.prompts.size,
         total: totalPromptCount.count
       });
 
-      // Format all prompt documents
-      const promptDocs: ChromaDocument[] = [];
-      for (const prompt of prompts) {
-        promptDocs.push(this.formatUserPromptDoc(prompt));
-      }
-
-      // Sync in batches
-      for (let i = 0; i < promptDocs.length; i += this.BATCH_SIZE) {
-        const batch = promptDocs.slice(i, i + this.BATCH_SIZE);
-        await this.addDocuments(batch);
-
-        logger.debug('CHROMA_SYNC', 'Backfill progress', {
-          project: backfillProject,
-          progress: `${Math.min(i + this.BATCH_SIZE, promptDocs.length)}/${promptDocs.length}`
-        });
-      }
-
       logger.info('CHROMA_SYNC', 'Smart backfill complete', {
         project: backfillProject,
         synced: {
-          observationDocs: allDocs.length,
-          summaryDocs: summaryDocs.length,
-          promptDocs: promptDocs.length
+          observationDocs: totalObsDocs,
+          summaryDocs: totalSummaryDocs,
+          promptDocs: totalPromptDocs
         },
         skipped: {
           observations: existing.observations.size,

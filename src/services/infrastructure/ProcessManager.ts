@@ -192,10 +192,10 @@ export async function getChildProcesses(parentPid: number): Promise<number[]> {
   }
 
   try {
-    // Use WQL -Filter to avoid $_ pipeline syntax that breaks in Git Bash (#1062, #1024).
-    // Get-CimInstance with server-side filtering is also more efficient than piping through Where-Object.
-    const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter 'ParentProcessId=${parentPid}' | Select-Object -ExpandProperty ProcessId"`;
-    const { stdout } = await execAsync(cmd, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, windowsHide: true });
+    // PowerShell Get-Process instead of WMIC (deprecated in Windows 11)
+    const cmd = `powershell -NoProfile -NonInteractive -Command "Get-Process | Where-Object { \$_.ParentProcessId -eq ${parentPid} } | Select-Object -ExpandProperty Id"`;
+    const { stdout } = await execAsync(cmd, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, cwd: process.env.USERPROFILE || process.env.HOME || 'C:\\' });
+    // PowerShell outputs just numbers (one per line), simpler than WMIC's "ProcessId=1234" format
     return stdout
       .split('\n')
       .map(line => line.trim())
@@ -316,14 +316,13 @@ export async function cleanupOrphanedProcesses(): Promise<void> {
 
   try {
     if (isWindows) {
-      // Windows: Use WQL -Filter for server-side filtering (no $_ pipeline syntax).
-      // Avoids Git Bash $_ interpretation (#1062) and PowerShell syntax errors (#1024).
-      const wqlPatternConditions = ORPHAN_PROCESS_PATTERNS
-        .map(p => `CommandLine LIKE '%${p}%'`)
-        .join(' OR ');
+      // Windows: Use PowerShell Get-CimInstance with JSON output for age filtering
+      const patternConditions = ORPHAN_PROCESS_PATTERNS
+        .map(p => `\$_.CommandLine -like '*${p}*'`)
+        .join(' -or ');
 
-      const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter '(${wqlPatternConditions}) AND ProcessId != ${currentPid}' | Select-Object ProcessId, CreationDate | ConvertTo-Json"`;
-      const { stdout } = await execAsync(cmd, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, windowsHide: true });
+      const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process | Where-Object { (${patternConditions}) -and \$_.ProcessId -ne ${currentPid} } | Select-Object ProcessId, CreationDate | ConvertTo-Json"`;
+      const { stdout } = await execAsync(cmd, { timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND, cwd: process.env.USERPROFILE || process.env.HOME || 'C:\\' });
 
       if (!stdout.trim() || stdout.trim() === 'null') {
         logger.debug('SYSTEM', 'No orphaned claude-mem processes found (Windows)');
@@ -632,29 +631,32 @@ export function spawnDaemon(
   };
 
   if (isWindows) {
-    // Use PowerShell Start-Process to spawn a hidden, independent process
-    // Unlike WMIC, PowerShell inherits environment variables from parent
-    // -WindowStyle Hidden prevents console popup
-    const runtimePath = resolveWorkerRuntimePath();
+    // Use PowerShell Start-Process to spawn an independent daemon process
+    // WMIC was removed in Windows 11 24H2+, so we use PowerShell instead
+    // Start-Process -WindowStyle Hidden prevents console popups
+    const execPath = process.execPath.replace(/'/g, "''");
+    const script = scriptPath.replace(/'/g, "''");
 
-    if (!runtimePath) {
-      logger.error('SYSTEM', 'Failed to locate Bun runtime for Windows worker spawn');
-      return undefined;
-    }
+    // Build env string for PowerShell: set each extraEnv var before spawning
+    const envSetters = Object.entries({ CLAUDE_MEM_WORKER_PORT: String(port), ...extraEnv })
+      .map(([k, v]) => `\$env:${k}='${v.replace(/'/g, "''")}'`)
+      .join('; ');
 
-    const escapedRuntimePath = runtimePath.replace(/'/g, "''");
-    const escapedScriptPath = scriptPath.replace(/'/g, "''");
-    const psCommand = `Start-Process -FilePath '${escapedRuntimePath}' -ArgumentList '${escapedScriptPath}','--daemon' -WindowStyle Hidden`;
+    // PowerShell Start-Process with -PassThru to get the PID
+    const psCommand = `${envSetters}; $p = Start-Process -FilePath '${execPath}' -ArgumentList '"${script}"','--daemon' -WindowStyle Hidden -PassThru; $p.Id`;
+    const cmd = `powershell -NoProfile -NonInteractive -Command "${psCommand.replace(/"/g, '\"')}"`;
 
     try {
-      execSync(`powershell -NoProfile -Command "${psCommand}"`, {
-        stdio: 'ignore',
+      const result = execSync(cmd, {
+        stdio: ['ignore', 'pipe', 'ignore'],
         windowsHide: true,
-        env
+        env,
+        cwd: process.env.USERPROFILE || process.env.HOME || 'C:\\'
       });
-      return 0;
-    } catch (error) {
-      logger.error('SYSTEM', 'Failed to spawn worker daemon on Windows', { runtimePath }, error as Error);
+      const pid = parseInt(result.toString().trim(), 10);
+      // Return undefined for invalid PIDs (0, NaN, negative) so caller detects failure
+      return pid > 0 ? pid : undefined;
+    } catch {
       return undefined;
     }
   }
@@ -683,7 +685,8 @@ export function spawnDaemon(
   const child = spawn(process.execPath, [scriptPath, '--daemon'], {
     detached: true,
     stdio: 'ignore',
-    env
+    env,
+    cwd: process.env.HOME || '/tmp'
   });
 
   if (child.pid === undefined) {

@@ -12,8 +12,8 @@
  * Fixes #818: Worker fails to start on fresh install
  */
 import { spawnSync, spawn } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
-import { join, dirname, resolve } from 'path';
+import { existsSync } from 'fs';
+import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
@@ -116,48 +116,24 @@ if (!bunPath) {
   process.exit(1);
 }
 
-// Fix #646: Buffer stdin in Node.js before passing to Bun.
-// On Linux, Bun's libuv calls fstat() on inherited pipe fds and crashes with
-// EINVAL when the pipe comes from Claude Code's hook system. By reading stdin
-// in Node.js first and writing it to a fresh pipe, Bun receives a normal pipe
-// that it can fstat() without errors.
-function collectStdin() {
-  return new Promise((resolve) => {
-    // If stdin is a TTY (interactive), there's no piped data to collect
-    if (process.stdin.isTTY) {
-      resolve(null);
-      return;
-    }
-
-    const chunks = [];
-    process.stdin.on('data', (chunk) => chunks.push(chunk));
-    process.stdin.on('end', () => {
-      resolve(chunks.length > 0 ? Buffer.concat(chunks) : null);
-    });
-    process.stdin.on('error', () => {
-      // stdin may not be readable (e.g. already closed), treat as no data
-      resolve(null);
-    });
-
-    // Safety: if no data arrives within 5s, proceed without stdin
-    setTimeout(() => {
-      process.stdin.removeAllListeners();
-      process.stdin.pause();
-      resolve(chunks.length > 0 ? Buffer.concat(chunks) : null);
-    }, 5000);
-  });
-}
-
-const stdinData = await collectStdin();
+// Extract the script path and its directory for cwd
+// This prevents EPERM errors when hooks run from C:\WINDOWS\system32
+// by ensuring Bun always runs from a valid working directory
+const scriptPath = args[0];
+const scriptDir = scriptPath ? dirname(scriptPath) : homedir();
 
 // Spawn Bun with the provided script and args
 // Use spawn (not spawnSync) to properly handle stdio
 // Note: Don't use shell mode on Windows - it breaks paths with spaces in usernames
-// Use windowsHide to prevent a visible console window from spawning on Windows
+// Set cwd to script directory to avoid inheriting C:\WINDOWS\system32
+// Set CLAUDE_MEM_SHOW_CONSOLE=1 to show Bun console window (Windows only)
+const showConsole = process.env.CLAUDE_MEM_SHOW_CONSOLE === '1';
+
 const child = spawn(bunPath, args, {
-  stdio: [stdinData ? 'pipe' : 'ignore', 'inherit', 'inherit'],
-  windowsHide: true,
-  env: process.env
+  stdio: 'inherit',
+  windowsHide: !showConsole,  // Show console if env var is set
+  env: process.env,
+  cwd: scriptDir
 });
 
 // Write buffered stdin to child's pipe, then close it so the child sees EOF

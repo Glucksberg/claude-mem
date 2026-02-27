@@ -1,16 +1,16 @@
 {
-  "name": "thedotmack",
+  "name": "oreginha",
   "owner": {
-    "name": "Alex Newman"
+    "name": "Oreginha"
   },
   "metadata": {
-    "description": "Plugins by Alex Newman (thedotmack)",
-    "homepage": "https://github.com/thedotmack/claude-mem"
+    "description": "Fork with Spanish translations and Windows improvements",
+    "homepage": "https://github.com/oreginha/claude-memory-skill"
   },
   "plugins": [
     {
-      "name": "claude-mem",
-      "version": "10.5.2",
+      "name": "claude-memory-skill",
+      "version": "9.1.1",
       "source": "./plugin",
       "description": "Persistent memory system for Claude Code - context compression across sessions"
     }
