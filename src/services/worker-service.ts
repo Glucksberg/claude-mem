@@ -148,6 +148,7 @@ import {
   updateCursorContextForProject,
   handleCursorCommand
 } from './integrations/CursorHooksInstaller.js';
+import { handleOpenCodeCommand } from './integrations/OpenCodePluginInstaller.js';
 
 // Service layer imports
 import { DatabaseManager } from './worker/DatabaseManager.js';
@@ -156,7 +157,7 @@ import { SSEBroadcaster } from './worker/SSEBroadcaster.js';
 import { SDKAgent } from './worker/SDKAgent.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from './worker/GeminiAgent.js';
 import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from './worker/OpenRouterAgent.js';
-import { OpenAICodexAgent, isOpenAICodexSelected, isOpenAICodexAvailable } from './worker/OpenAICodexAgent.js';
+import { OpenCodeAgent, isOpenCodeSelected, isOpenCodeAvailable } from './worker/OpenCodeAgent.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
 import { SettingsManager } from './worker/SettingsManager.js';
 import { SearchManager } from './worker/SearchManager.js';
@@ -219,11 +220,11 @@ export class WorkerService {
   // Service layer
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
-  private sseBroadcaster: SSEBroadcaster;
+  public sseBroadcaster: SSEBroadcaster;
   private sdkAgent: SDKAgent;
   private geminiAgent: GeminiAgent;
   private openRouterAgent: OpenRouterAgent;
-  private openAICodexAgent: OpenAICodexAgent;
+  private openCodeAgent: OpenCodeAgent;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
@@ -274,14 +275,7 @@ export class WorkerService {
     this.sdkAgent = new SDKAgent(this.dbManager, this.sessionManager);
     this.geminiAgent = new GeminiAgent(this.dbManager, this.sessionManager);
     this.openRouterAgent = new OpenRouterAgent(this.dbManager, this.sessionManager);
-    this.openAICodexAgent = new OpenAICodexAgent(this.dbManager, this.sessionManager);
-
-    // Configure fallback chain for non-Claude providers.
-    // If provider-specific API calls fail with transient/recoverable errors,
-    // the request can continue via the Claude SDK agent.
-    this.geminiAgent.setFallbackAgent(this.sdkAgent);
-    this.openRouterAgent.setFallbackAgent(this.sdkAgent);
-    this.openAICodexAgent.setFallbackAgent(this.sdkAgent);
+    this.openCodeAgent = new OpenCodeAgent(this.dbManager, this.sessionManager);
 
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
@@ -310,8 +304,8 @@ export class WorkerService {
       workerPath: __filename,
       getAiStatus: () => {
         let provider = 'claude';
-        if (isCopilotSelected() && isCopilotAvailable()) provider = 'github-copilot';
-        else if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
+        if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
+        else if (isOpenCodeSelected() && isOpenCodeAvailable()) provider = 'opencode';
         else if (isGeminiSelected() && isGeminiAvailable()) provider = 'gemini';
 
         // Check OAuth token health for proactive monitoring
@@ -438,7 +432,7 @@ export class WorkerService {
 
     // Standard routes (registered AFTER guard middleware)
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.openAICodexAgent, this.sessionEventBroadcaster, this));
+    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.openCodeAgent, this.sessionEventBroadcaster, this));
     this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
@@ -569,10 +563,16 @@ export class WorkerService {
 
       // Connect to MCP server
       const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
+      const transportEnv: Record<string, string> = {};
+      for (const [key, value] of Object.entries(process.env)) {
+        if (value !== undefined) {
+          transportEnv[key] = value;
+        }
+      }
       const transport = new StdioClientTransport({
         command: 'node',
         args: [mcpServerPath],
-        env: process.env
+        env: transportEnv
       });
 
       const MCP_INIT_TIMEOUT_MS = 300000;
@@ -687,17 +687,15 @@ export class WorkerService {
    * silently falls back to SDK — used for background startup recovery where
    * throwing would leave pending messages stuck.
    */
-  /**
-   * Resolve the effective provider for a session.
-   * OpenClaw sessions (contentSessionId starts with 'openclaw-') use
-   * CLAUDE_MEM_OPENCLAW_PROVIDER if configured; otherwise fall back to
-   * the global CLAUDE_MEM_PROVIDER.
-   */
-  private resolveProviderForSession(contentSessionId?: string): string {
-    const { USER_SETTINGS_PATH } = require('../shared/paths.js');
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    if (contentSessionId?.startsWith('openclaw-') && settings.CLAUDE_MEM_OPENCLAW_PROVIDER) {
-      return settings.CLAUDE_MEM_OPENCLAW_PROVIDER;
+  private getActiveAgent(): SDKAgent | GeminiAgent | OpenRouterAgent | OpenCodeAgent {
+    if (isOpenRouterSelected() && isOpenRouterAvailable()) {
+      return this.openRouterAgent;
+    }
+    if (isOpenCodeSelected() && isOpenCodeAvailable()) {
+      return this.openCodeAgent;
+    }
+    if (isGeminiSelected() && isGeminiAvailable()) {
+      return this.geminiAgent;
     }
     return settings.CLAUDE_MEM_PROVIDER || 'claude';
   }
@@ -1344,6 +1342,12 @@ async function main() {
       break;
     }
 
+    case 'opencode': {
+      const subcommand = process.argv[3];
+      const openCodeResult = await handleOpenCodeCommand(subcommand, process.argv.slice(4));
+      process.exit(openCodeResult);
+    }
+
     case 'hook': {
       // Auto-start worker if not running
       const workerReady = await ensureWorkerStarted(port);
@@ -1354,12 +1358,12 @@ async function main() {
       // Existing logic unchanged
       const platform = process.argv[3];
       const event = process.argv[4];
-      if (!platform || !event) {
-        console.error('Usage: claude-mem hook <platform> <event>');
-        console.error('Platforms: claude-code, cursor, raw');
-        console.error('Events: context, session-init, observation, summarize, thoughts-extract, session-complete');
-        process.exit(1);
-      }
+        if (!platform || !event) {
+          console.error('Usage: claude-mem hook <platform> <event>');
+          console.error('Platforms: claude-code, cursor, opencode, raw');
+          console.error('Events: context, session-init, observation, summarize, session-complete');
+          process.exit(1);
+        }
 
       // Check if worker is already running on port
       const portInUse = await isPortInUse(port);

@@ -414,7 +414,7 @@ export function ContextSettingsModal({
             >
               <FormField
                 label="AI Provider"
-                tooltip="Choose the AI provider used for observation extraction"
+                tooltip="Choose the backend provider used for memory extraction"
               >
                 <select
                   value={formState.CLAUDE_MEM_PROVIDER || 'claude'}
@@ -423,7 +423,7 @@ export function ContextSettingsModal({
                   <option value="claude">Claude (uses your Claude account)</option>
                   <option value="gemini">Gemini (uses API key)</option>
                   <option value="openrouter">OpenRouter (multi-model)</option>
-                  <option value="openai-codex">OpenAI Codex (ChatGPT Plus/Pro OAuth)</option>
+                  <option value="opencode">OpenCode SDK (opencode server)</option>
                 </select>
               </FormField>
 
@@ -530,53 +530,33 @@ export function ContextSettingsModal({
                 </>
               )}
 
-              {formState.CLAUDE_MEM_PROVIDER === 'openai-codex' && (
+              {formState.CLAUDE_MEM_PROVIDER === 'opencode' && (
                 <>
                   <FormField
-                    label="Model"
-                    tooltip="OpenAI model to use for observation extraction (your ChatGPT Plus/Pro subscription grants access to GPT-5.x Codex models)"
-                  >
-                    <select
-                      value={formState.CLAUDE_MEM_OPENAI_CODEX_MODEL || 'gpt-4o'}
-                      onChange={(e) => updateSetting('CLAUDE_MEM_OPENAI_CODEX_MODEL', e.target.value)}
-                    >
-                      <option value="gpt-4o">gpt-4o (recommended)</option>
-                      <option value="gpt-4o-mini">gpt-4o-mini (faster)</option>
-                      <option value="gpt-5.3-codex">gpt-5.3-codex (latest, Plus/Pro only)</option>
-                    </select>
-                  </FormField>
-                  <FormField
-                    label="Agent Dir (Optional)"
-                    tooltip="Path to the directory containing auth-profiles.json. Leave empty to auto-detect from OpenClaw installation."
+                    label="OpenCode Base URL"
+                    tooltip="OpenCode server URL used by the SDK client"
                   >
                     <input
                       type="text"
-                      value={formState.CLAUDE_MEM_OPENAI_CODEX_AGENT_DIR || ''}
-                      onChange={(e) => updateSetting('CLAUDE_MEM_OPENAI_CODEX_AGENT_DIR', e.target.value)}
-                      placeholder="Auto-detect from OpenClaw (leave empty)"
+                      value={formState.CLAUDE_MEM_OPENCODE_BASE_URL || 'http://127.0.0.1:4096'}
+                      onChange={(e) => updateSetting('CLAUDE_MEM_OPENCODE_BASE_URL', e.target.value)}
+                      placeholder="http://127.0.0.1:4096"
                     />
                   </FormField>
-                  <div style={{ padding: '8px 0', fontSize: '12px', color: 'var(--text-muted, #888)' }}>
-                    ℹ️ Authentication is managed by OpenClaw. Run <code>openclaw auth</code> to sign in with your ChatGPT account.
-                  </div>
+                  <FormField
+                    label="OpenCode Mode"
+                    tooltip="sdk_agent runs LLM extraction; direct_store stores tool payloads directly"
+                  >
+                    <select
+                      value={formState.CLAUDE_MEM_OPENCODE_MODE || 'sdk_agent'}
+                      onChange={(e) => updateSetting('CLAUDE_MEM_OPENCODE_MODE', e.target.value)}
+                    >
+                      <option value="sdk_agent">sdk_agent (OpenCode SDK extraction)</option>
+                      <option value="direct_store">direct_store (existing direct persist)</option>
+                    </select>
+                  </FormField>
                 </>
               )}
-
-              <FormField
-                label="OpenClaw Provider Override"
-                tooltip="AI provider used exclusively for sessions originating from OpenClaw. Leave empty to use the global provider above for all sessions. Recommended: openai-codex (uses ChatGPT subscription, avoids Anthropic ToS restriction for third-party apps)."
-              >
-                <select
-                  value={formState.CLAUDE_MEM_OPENCLAW_PROVIDER || ''}
-                  onChange={(e) => updateSetting('CLAUDE_MEM_OPENCLAW_PROVIDER', e.target.value)}
-                >
-                  <option value="">Same as global provider</option>
-                  <option value="claude">Claude (Anthropic OAuth — not recommended for OpenClaw)</option>
-                  <option value="gemini">Gemini</option>
-                  <option value="openrouter">OpenRouter</option>
-                  <option value="openai-codex">OpenAI Codex (ChatGPT Plus/Pro OAuth)</option>
-                </select>
-              </FormField>
 
               <FormField
                 label="Worker Port"

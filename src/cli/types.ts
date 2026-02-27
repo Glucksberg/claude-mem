@@ -1,8 +1,7 @@
 export interface NormalizedHookInput {
   sessionId: string;
   cwd: string;
-  platform?: string;   // 'claude-code' or 'cursor'
-  isSubagent?: boolean;
+  platform?: string;
   prompt?: string;
   toolName?: string;
   toolInput?: unknown;

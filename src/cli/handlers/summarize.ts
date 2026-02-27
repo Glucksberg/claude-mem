@@ -57,6 +57,7 @@ export const summarizeHandler: EventHandler = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contentSessionId: sessionId,
+          platform: input.platform,
           last_assistant_message: lastAssistantMessage
         }),
       },
