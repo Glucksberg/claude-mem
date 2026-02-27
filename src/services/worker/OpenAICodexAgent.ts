@@ -16,7 +16,7 @@
  * Responsibility:
  * - Read OpenAI Codex OAuth credentials from auth-profiles.json
  * - Auto-refresh expired tokens via pi-ai's refreshOpenAICodexToken
- * - Call OpenAI Chat Completions API for observation extraction
+ * - Call OpenAI Codex responses API for observation extraction
  * - Parse XML responses (same format as Claude/Gemini/OpenRouter agents)
  * - Sync to database and Chroma
  */
@@ -45,11 +45,19 @@ import {
   type FallbackAgent,
 } from './agents/index.js';
 
-// OpenAI Chat Completions endpoint
-const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
+// OpenAI Codex OAuth endpoint (ChatGPT backend responses API)
+const OPENAI_CODEX_API_URL = 'https://chatgpt.com/backend-api/codex/responses';
+
+// Codex responses require stream=true and store=false.
+const CODEX_STREAM = true;
+const CODEX_STORE = false;
+
+// Codex endpoint currently requires explicit instructions.
+const CODEX_INSTRUCTIONS =
+  'You are Claude-Mem observation extraction assistant. Follow the prompt exactly and output only the requested content.';
 
 // Default model for OpenAI Codex OAuth (GPT-5.x Codex series)
-const DEFAULT_CODEX_MODEL = 'gpt-4o'; // Conservative default; override with CLAUDE_MEM_OPENAI_CODEX_MODEL
+const DEFAULT_CODEX_MODEL = 'gpt-5.3-codex';
 
 // Context window limits (same as OpenRouterAgent)
 const DEFAULT_MAX_CONTEXT_MESSAGES = 20;
@@ -70,21 +78,27 @@ interface AuthProfileStore {
   profiles: Record<string, AuthProfile>;
 }
 
-// OpenAI-compatible message format
-interface OpenAIMessage {
-  role: 'user' | 'assistant' | 'system';
+// Codex responses input format
+interface CodexInputMessage {
+  role: 'user' | 'assistant';
   content: string;
 }
 
-interface OpenAIResponse {
-  choices?: Array<{
-    message?: { role?: string; content?: string };
-    finish_reason?: string;
-  }>;
-  usage?: {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    total_tokens?: number;
+interface CodexStreamEvent {
+  type?: string;
+  delta?: string;
+  text?: string;
+  response?: {
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      total_tokens?: number;
+    };
+    output?: Array<{
+      type?: string;
+      content?: Array<{ type?: string; text?: string }>;
+    }>;
+    error?: { message?: string; code?: string };
   };
   error?: { message?: string; code?: string };
 }
@@ -418,7 +432,7 @@ export class OpenAICodexAgent {
     return truncated;
   }
 
-  private toOpenAIMessages(history: ConversationMessage[]): OpenAIMessage[] {
+  private toCodexInput(history: ConversationMessage[]): CodexInputMessage[] {
     return history.map(m => ({
       role: m.role === 'assistant' ? 'assistant' : 'user',
       content: m.content,
@@ -426,7 +440,7 @@ export class OpenAICodexAgent {
   }
 
   /**
-   * Call OpenAI Chat Completions with OAuth Bearer token.
+   * Call OpenAI Codex responses endpoint with OAuth Bearer token.
    * Token is refreshed automatically if expired.
    */
   private async query(
@@ -434,51 +448,115 @@ export class OpenAICodexAgent {
     model: string,
   ): Promise<{ content: string; tokensUsed?: number }> {
     const accessToken = await getAccessToken();
-    const messages = this.toOpenAIMessages(this.truncateHistory(history));
+    const input = this.toCodexInput(this.truncateHistory(history));
 
-    logger.debug('SDK', `Querying OpenAI Codex (${model})`, { turns: messages.length });
+    logger.debug('SDK', `Querying OpenAI Codex (${model})`, { turns: input.length });
 
-    const response = await fetch(OPENAI_API_URL, {
+    const response = await fetch(OPENAI_CODEX_API_URL, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
       },
       body: JSON.stringify({
         model,
-        messages,
-        temperature: 0.3,
-        max_tokens: 4096,
+        instructions: CODEX_INSTRUCTIONS,
+        input,
+        stream: CODEX_STREAM,
+        store: CODEX_STORE,
       }),
     });
 
+    const rawBody = await response.text();
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`OpenAI Codex API error: ${response.status} — ${errorText}`);
+      throw new Error(`OpenAI Codex API error: ${response.status} — ${rawBody}`);
     }
 
-    const data = await response.json() as OpenAIResponse;
+    let accumulatedText = '';
+    let completedText = '';
+    let tokensUsed: number | undefined;
+    let inputTokens: number | undefined;
+    let outputTokens: number | undefined;
 
-    if (data.error) {
-      throw new Error(`OpenAI Codex API error: ${data.error.code} — ${data.error.message}`);
+    const lines = rawBody.split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+
+      let event: CodexStreamEvent;
+      try {
+        event = JSON.parse(payload) as CodexStreamEvent;
+      } catch {
+        continue;
+      }
+
+      if (event.error?.message) {
+        throw new Error(`OpenAI Codex API error: ${event.error.code ?? 'unknown'} — ${event.error.message}`);
+      }
+
+      switch (event.type) {
+        case 'response.output_text.delta':
+          if (typeof event.delta === 'string') {
+            accumulatedText += event.delta;
+          }
+          break;
+        case 'response.output_text.done':
+          if (typeof event.text === 'string') {
+            completedText = event.text;
+          }
+          break;
+        case 'response.completed': {
+          const usage = event.response?.usage;
+          tokensUsed = usage?.total_tokens;
+          inputTokens = usage?.input_tokens;
+          outputTokens = usage?.output_tokens;
+
+          const output = event.response?.output;
+          if (Array.isArray(output)) {
+            const parts: string[] = [];
+            for (const item of output) {
+              if (item?.type !== 'message' || !Array.isArray(item.content)) continue;
+              for (const part of item.content) {
+                if (part?.type === 'output_text' && typeof part.text === 'string') {
+                  parts.push(part.text);
+                }
+              }
+            }
+            if (parts.length > 0) {
+              completedText = parts.join('');
+            }
+          }
+
+          if (event.response?.error?.message) {
+            throw new Error(
+              `OpenAI Codex API error: ${event.response.error.code ?? 'unknown'} — ${event.response.error.message}`,
+            );
+          }
+          break;
+        }
+      }
     }
 
-    if (!data.choices?.[0]?.message?.content) {
+    const content = completedText || accumulatedText;
+    if (!content) {
       logger.error('SDK', 'Empty response from OpenAI Codex');
       return { content: '' };
     }
 
-    const tokensUsed = data.usage?.total_tokens;
     if (tokensUsed) {
       logger.info('SDK', 'OpenAI Codex API usage', {
         model,
-        inputTokens: data.usage?.prompt_tokens,
-        outputTokens: data.usage?.completion_tokens,
+        inputTokens,
+        outputTokens,
         totalTokens: tokensUsed,
       });
     }
 
-    return { content: data.choices[0].message.content, tokensUsed };
+    return { content, tokensUsed };
   }
 }
 

@@ -19,7 +19,8 @@ export interface SettingsDefaults {
   CLAUDE_MEM_WORKER_HOST: string;
   CLAUDE_MEM_SKIP_TOOLS: string;
   // AI Provider Configuration
-  CLAUDE_MEM_PROVIDER: string;  // 'claude' | 'gemini' | 'openrouter' | 'github-copilot'
+  CLAUDE_MEM_PROVIDER: string;          // 'claude' | 'gemini' | 'openrouter' | 'openai-codex'
+  CLAUDE_MEM_OPENCLAW_PROVIDER: string; // Override provider for OpenClaw sessions (empty = use CLAUDE_MEM_PROVIDER)
   CLAUDE_MEM_CLAUDE_AUTH_METHOD: string;  // 'cli' | 'api' - how Claude provider authenticates
   CLAUDE_MEM_GEMINI_API_KEY: string;
   CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash-preview'
