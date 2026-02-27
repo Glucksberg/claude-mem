@@ -172,10 +172,8 @@ import { SearchRoutes } from './worker/http/routes/SearchRoutes.js';
 import { SettingsRoutes } from './worker/http/routes/SettingsRoutes.js';
 import { LogsRoutes } from './worker/http/routes/LogsRoutes.js';
 import { MemoryRoutes } from './worker/http/routes/MemoryRoutes.js';
-import { FeedRoutes } from './worker/http/routes/FeedRoutes.js';
-
-// Feed daemon
-import { FeedDaemon } from './feed/FeedDaemon.js';
+import { BackupRoutes } from './worker/http/routes/BackupRoutes.js';
+import { LitestreamManager } from './backup/LitestreamManager.js';
 
 // Process management for zombie cleanup (Issue #737)
 import { startOrphanReaper, reapOrphanedProcesses, getActiveProcesses } from './worker/ProcessRegistry.js';
@@ -239,6 +237,9 @@ export class WorkerService {
 
   // Chroma MCP manager (lazy - connects on first use)
   private chromaMcpManager: ChromaMcpManager | null = null;
+
+  // Litestream cloud backup manager
+  private litestreamManager: LitestreamManager | null = null;
 
   // Initialization tracking
   private initializationComplete: Promise<void>;
@@ -548,8 +549,42 @@ export class WorkerService {
       this.server.registerRoutes(this.searchRoutes);
       logger.info('WORKER', 'SearchManager initialized and search routes registered');
 
-      // Mark core initialization complete BEFORE MCP connection
-      // MCP is optional (vector search) and should not block core functionality
+      // Auto-backfill Chroma for all projects if out of sync with SQLite (fire-and-forget)
+      if (this.chromaMcpManager) {
+        ChromaSync.backfillAllProjects().then(() => {
+          logger.info('CHROMA_SYNC', 'Backfill check complete for all projects');
+        }).catch(error => {
+          logger.error('CHROMA_SYNC', 'Backfill failed (non-blocking)', {}, error as Error);
+        });
+      }
+
+      // Start Litestream cloud backup (fire-and-forget)
+      this.litestreamManager = LitestreamManager.getInstance();
+      this.litestreamManager.start().catch(error => {
+        logger.error('BACKUP', 'Litestream start failed (non-blocking)', {}, error as Error);
+      });
+
+      // Register backup routes now that LitestreamManager is available
+      this.server.registerRoutes(new BackupRoutes(this.litestreamManager));
+
+      // Connect to MCP server
+      const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
+      const transport = new StdioClientTransport({
+        command: 'node',
+        args: [mcpServerPath],
+        env: process.env
+      });
+
+      const MCP_INIT_TIMEOUT_MS = 300000;
+      const mcpConnectionPromise = this.mcpClient.connect(transport);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('MCP connection timeout after 5 minutes')), MCP_INIT_TIMEOUT_MS)
+      );
+
+      await Promise.race([mcpConnectionPromise, timeoutPromise]);
+      this.mcpReady = true;
+      logger.success('WORKER', 'Connected to MCP server');
+
       this.initializationCompleteFlag = true;
       this.resolveInitialization();
       logger.info('SYSTEM', 'Core initialization complete (MCP connecting in background)');
@@ -1027,6 +1062,12 @@ export class WorkerService {
     if (this.staleSessionReaperInterval) {
       clearInterval(this.staleSessionReaperInterval);
       this.staleSessionReaperInterval = null;
+    }
+
+    // Stop Litestream replication before closing DB
+    if (this.litestreamManager) {
+      await this.litestreamManager.stop();
+      this.litestreamManager = null;
     }
 
     await performGracefulShutdown({
