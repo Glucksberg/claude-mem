@@ -18,7 +18,7 @@ import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
 import { getAuthMethodDescription, checkOAuthTokenStatus } from '../shared/EnvManager.js';
 import { logger } from '../utils/logger.js';
-import { withTimeout } from '../utils/with-timeout.js';
+import { acquireSpawnLock } from './infrastructure/singleton-manager.js';
 
 // Windows: avoid repeated spawn popups when startup fails (issue #921)
 const WINDOWS_SPAWN_COOLDOWN_MS = 2 * 60 * 1000;
@@ -429,7 +429,16 @@ export class WorkerService {
     const host = getWorkerHost();
 
     // Start HTTP server FIRST - make port available immediately
-    await this.server.listen(port, host);
+    // If port is already bound, exit immediately (another worker won the race)
+    try {
+      await this.server.listen(port, host);
+    } catch (error: any) {
+      if (error.code === 'EADDRINUSE') {
+        logger.info('SYSTEM', 'Port already bound by another worker — exiting', { port });
+        process.exit(0);
+      }
+      throw error;
+    }
 
     // Worker writes its own PID - reliable on all platforms
     // This happens after listen() succeeds, ensuring the worker is actually ready
@@ -1064,20 +1073,15 @@ async function ensureWorkerStarted(port: number): Promise<boolean> {
     return false;
   }
 
-  const spawnLockAcquired = tryAcquireSpawnLock();
-  if (!spawnLockAcquired) {
-    logger.info('SYSTEM', 'Worker spawn already in progress, waiting for health');
-    const healthy = await waitForHealth(port, getPlatformTimeout(30000));
-    if (healthy) {
-      logger.info('SYSTEM', 'Worker is now healthy');
+  // Acquire spawn lock — only one process at a time can attempt to spawn
+  const spawnResult = await acquireSpawnLock(async () => {
+    // Re-check health inside lock (another process may have spawned while we waited)
+    if (await waitForHealth(port, 500)) {
+      logger.info('SYSTEM', 'Worker became healthy while acquiring lock');
       return true;
     }
-    logger.error('SYSTEM', 'Worker spawn lock held but worker did not become healthy');
-    return false;
-  }
 
-  // Spawn new worker daemon
-  try {
+    // Spawn new worker daemon
     logger.info('SYSTEM', 'Starting worker daemon');
     markWorkerSpawnAttempted();
     const pid = spawnDaemon(__filename, port);
@@ -1086,10 +1090,7 @@ async function ensureWorkerStarted(port: number): Promise<boolean> {
       return false;
     }
 
-    // PID file is written by the worker itself after listen() succeeds
-    // This is race-free and works correctly on Windows where cmd.exe PID is useless
-
-    const healthy = await waitForHealth(port, getPlatformTimeout(30000));
+    const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
     if (!healthy) {
       removePidFile();
       logger.error('SYSTEM', 'Worker failed to start (health check timeout)');
@@ -1099,9 +1100,20 @@ async function ensureWorkerStarted(port: number): Promise<boolean> {
     clearWorkerSpawnAttempted();
     logger.info('SYSTEM', 'Worker started successfully');
     return true;
-  } finally {
-    releaseSpawnLock();
+  }, port);
+
+  // If lock was held by another process, wait for port health
+  if (spawnResult === null) {
+    const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
+    if (healthy) {
+      logger.info('SYSTEM', 'Worker started by another process');
+      return true;
+    }
+    logger.error('SYSTEM', 'Worker not healthy after waiting for other spawner');
+    return false;
   }
+
+  return spawnResult;
 }
 
 // ============================================================================

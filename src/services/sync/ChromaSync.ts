@@ -76,6 +76,20 @@ export class ChromaSync {
   private collectionCreated = false;
   private readonly BATCH_SIZE = 100;
 
+  // Windows popup concern resolved: the worker daemon starts with -WindowStyle Hidden,
+  // so child processes (uvx/chroma-mcp) inherit the hidden console and don't create new windows.
+  // MCP SDK's StdioClientTransport uses shell:false and no detached flag, so console is inherited.
+  private readonly disabled: boolean = false;
+
+  // Connection mutex — coalesces concurrent ensureConnection() calls onto single spawn
+  private connectionPromise: Promise<void> | null = null;
+
+  // Circuit breaker — stops retry storms after repeated failures
+  private consecutiveFailures: number = 0;
+  private circuitOpenUntil: number = 0;
+  private static readonly MAX_FAILURES = 3;
+  private static readonly CIRCUIT_OPEN_MS = 60_000;
+
   constructor(project: string) {
     this.project = project;
     this.collectionName = `cm__${project}`;
@@ -194,17 +208,92 @@ export class ChromaSync {
       return;
     }
 
-    const chromaMcp = ChromaMcpManager.getInstance();
+    // Circuit breaker: stop retrying after repeated failures
+    if (Date.now() < this.circuitOpenUntil) {
+      throw new Error('Chroma circuit breaker open — connection disabled for 60s after repeated failures');
+    }
+
+    // Connection mutex: coalesce concurrent callers onto single spawn
+    if (this.connectionPromise) {
+      return this.connectionPromise;
+    }
+
+    // Capture reference to detect if a newer call replaced us.
+    // Without this, a concurrent caller's promise could be cleared by
+    // an older caller's finally{} block — a subtle race condition.
+    const p = this.connectionPromise = this._doConnect();
     try {
-      await chromaMcp.callTool('chroma_create_collection', {
-        collection_name: this.collectionName
+      await p;
+      this.consecutiveFailures = 0; // Reset on success
+    } catch (error) {
+      this.consecutiveFailures++;
+      if (this.consecutiveFailures >= ChromaSync.MAX_FAILURES) {
+        this.circuitOpenUntil = Date.now() + ChromaSync.CIRCUIT_OPEN_MS;
+        logger.warn('CHROMA_SYNC', 'Circuit breaker tripped — disabling Chroma for 60s', {
+          failures: this.consecutiveFailures
+        });
+      }
+      throw error;
+    } finally {
+      // Only clear if still the same promise (newer call may have replaced it)
+      if (this.connectionPromise === p) {
+        this.connectionPromise = null;
+      }
+    }
+  }
+
+  /**
+   * Internal connection logic — called only by ensureConnection() mutex
+   */
+  private async _doConnect(): Promise<void> {
+    logger.info('CHROMA_SYNC', 'Connecting to Chroma MCP server...', { project: this.project });
+
+    try {
+      const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+      const pythonVersion = settings.CLAUDE_MEM_PYTHON_VERSION;
+      const combinedCertPath = this.getCombinedCertPath();
+
+      const transportOptions: any = {
+        command: 'uvx',
+        args: [
+          '--python', pythonVersion,
+          'chroma-mcp',
+          '--client-type', 'persistent',
+          '--data-dir', this.VECTOR_DB_DIR
+        ],
+        stderr: 'ignore'
+      };
+
+      if (combinedCertPath) {
+        transportOptions.env = {
+          ...process.env,
+          SSL_CERT_FILE: combinedCertPath,
+          REQUESTS_CA_BUNDLE: combinedCertPath,
+          CURL_CA_BUNDLE: combinedCertPath
+        };
+        logger.info('CHROMA_SYNC', 'Using combined SSL certificates for Zscaler compatibility', {
+          certPath: combinedCertPath
+        });
+      }
+
+      this.transport = new StdioClientTransport(transportOptions);
+
+      this.client = new Client({
+        name: 'claude-mem-chroma-sync',
+        version: packageVersion
+      }, {
+        capabilities: {}
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes('already exists')) {
-        throw error;
+      // Safe cleanup: close transport before nulling reference
+      if (this.transport) {
+        try { await this.transport.close(); } catch {}
       }
-      // Collection already exists - this is the expected path after first creation
+      this.transport = null;
+      this.client = null;
+      this.connected = false;
+      logger.error('CHROMA_SYNC', 'Failed to connect to Chroma MCP server', { project: this.project }, error as Error);
+      throw new Error(`Chroma connection failed: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     this.collectionCreated = true;
@@ -223,12 +312,38 @@ export class ChromaSync {
     try {
       return JSON.parse(value);
     } catch (error) {
-      logger.warn('CHROMA_SYNC', 'Corrupted JSON field in observation, skipping', {
-        field: context?.field ?? 'unknown',
-        observationId: context?.obsId ?? 0,
-        preview: value.substring(0, 100)
-      });
-      return fallback;
+      // Check if this is a connection error - don't try to create collection
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const isConnectionError =
+        errorMessage.includes('Not connected') ||
+        errorMessage.includes('Connection closed') ||
+        errorMessage.includes('MCP error -32000');
+
+      if (isConnectionError) {
+        await this.safeResetConnection();
+        logger.error('CHROMA_SYNC', 'Connection lost during collection check',
+          { collection: this.collectionName }, error as Error);
+        throw new Error(`Chroma connection lost: ${errorMessage}`);
+      }
+
+      // Only attempt creation if it's genuinely a "collection not found" error
+      logger.error('CHROMA_SYNC', 'Collection check failed, attempting to create', { collection: this.collectionName }, error as Error);
+      logger.info('CHROMA_SYNC', 'Creating collection', { collection: this.collectionName });
+
+      try {
+        await this.client.callTool({
+          name: 'chroma_create_collection',
+          arguments: {
+            collection_name: this.collectionName,
+            embedding_function_name: 'default'
+          }
+        });
+
+        logger.info('CHROMA_SYNC', 'Collection created', { collection: this.collectionName });
+      } catch (createError) {
+        logger.error('CHROMA_SYNC', 'Failed to create collection', { collection: this.collectionName }, createError as Error);
+        throw new Error(`Collection creation failed: ${createError instanceof Error ? createError.message : String(createError)}`);
+      }
     }
   }
 
@@ -1046,8 +1161,7 @@ export class ChromaSync {
         errorMessage.includes('timed out');
 
       if (isConnectionError) {
-        // Reset collection state so next call attempts reconnect
-        this.collectionCreated = false;
+        await this.safeResetConnection();
         logger.error('CHROMA_SYNC', 'Connection lost during query',
           { project: this.project, query }, error as Error);
         throw new Error(`Chroma query failed - connection lost: ${errorMessage}`);
@@ -1095,9 +1209,23 @@ export class ChromaSync {
    * ChromaMcpManager is a singleton and manages its own lifecycle
    * We don't close it here - it's closed during graceful shutdown
    */
+  /**
+   * Safely reset connection state — closes transport BEFORE nulling reference.
+   * Prevents orphaned chroma-mcp subprocesses.
+   */
+  private async safeResetConnection(): Promise<void> {
+    const t = this.transport;
+    const c = this.client;
+    this.connected = false;
+    this.client = null;
+    this.transport = null;
+    if (c) { try { await c.close(); } catch {} }
+    if (t) { try { await t.close(); } catch {} }
+  }
+
   async close(): Promise<void> {
-    // ChromaMcpManager is a singleton and manages its own lifecycle
-    // We don't close it here - it's closed during graceful shutdown
-    logger.info('CHROMA_SYNC', 'ChromaSync closed', { project: this.project });
+    await this.safeResetConnection();
+    this.connectionPromise = null;
+    logger.info('CHROMA_SYNC', 'Chroma client and subprocess closed', { project: this.project });
   }
 }
