@@ -59,7 +59,9 @@ export const observationHandler: EventHandler = {
           tool_name: toolName,
           tool_input: toolInput,
           tool_response: toolResponse,
-          cwd
+          cwd,
+          branch: input.branch ?? null,
+          commit_sha: input.commitSha ?? null
         })
       }, 10000);
 

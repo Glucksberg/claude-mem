@@ -94,33 +94,19 @@ export async function processAgentResponse(
     memorySessionId: session.memorySessionId
   });
 
-  // ATOMIC TRANSACTION: Store observations + summary + confirm messages in one transaction
-  // This prevents duplicate observations if worker crashes between storage and confirmation
-  // (Issues #1036, #1091)
-  const pendingStore = sessionManager.getPendingMessageStore();
-  const messageIdsToConfirm = [...session.processingMessageIds];
-
-  const atomicStoreAndConfirm = sessionStore.db.transaction(() => {
-    // Store observations and summary
-    const txResult = sessionStore.storeObservations(
-      session.memorySessionId,
-      session.project,
-      observations,
-      summaryForStore,
-      session.lastPromptNumber,
-      discoveryTokens,
-      originalTimestamp ?? undefined
-    );
-
-    // Confirm all processing messages (delete from queue) within same transaction
-    for (const messageId of messageIdsToConfirm) {
-      pendingStore.confirmProcessed(messageId);
-    }
-
-    return txResult;
-  });
-
-  const result = atomicStoreAndConfirm();
+  // ATOMIC TRANSACTION: Store observations + summary ONCE
+  // Messages are already deleted from queue on claim, so no completion tracking needed
+  const result = sessionStore.storeObservations(
+    session.memorySessionId,
+    session.project,
+    observations,
+    summaryForStore,
+    session.lastPromptNumber,
+    discoveryTokens,
+    originalTimestamp ?? undefined,
+    session.lastBranch,
+    session.lastCommitSha
+  );
 
   // Log storage result with IDs for end-to-end traceability
   logger.info('DB', `STORED | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${result.observationIds.length} | obsIds=[${result.observationIds.join(',')}] | summaryId=${result.summaryId || 'none'}`, {

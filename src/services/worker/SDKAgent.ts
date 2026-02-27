@@ -413,6 +413,10 @@ export class SDKAgent {
         cwdTracker.lastCwd = message.cwd;
       }
 
+      // Capture branch metadata for branch memory
+      session.lastBranch = message.branch;
+      session.lastCommitSha = message.commit_sha;
+
       if (message.type === 'observation') {
         // Update last prompt number
         if (message.prompt_number !== undefined) {
