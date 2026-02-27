@@ -327,39 +327,26 @@ export class WorkerService {
       next(); // Delegate to SearchRoutes handler
     });
 
-    // Guard ALL /api/* routes during initialization — wait for DB with timeout
-    // Exceptions: /api/health, /api/readiness, /api/version (handled by Server.ts core routes)
-    // and /api/context/inject (handled above with fail-open)
-    this.server.app.use('/api', async (req, res, next) => {
-      if (this.initializationCompleteFlag) {
-        next();
-        return;
-      }
-
-      const timeoutMs = 30000;
-      const timeoutPromise = new Promise<void>((_, reject) =>
+    // Early handler for /api/sessions/init to wait for database initialization
+    // Fixes race condition where session-init hook is called before DB is ready
+    // See: https://github.com/thedotmack/claude-mem/issues/XXX
+    this.server.app.post('/api/sessions/init', async (req, res, next) => {
+      const timeoutMs = 30000; // 30 second timeout for session init
+      const timeoutPromise = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('Database initialization timeout')), timeoutMs)
       );
 
       try {
         await Promise.race([this.initializationComplete, timeoutPromise]);
-        next();
+        next(); // Delegate to SessionRoutes handler
       } catch (error) {
-        logger.error('HTTP', `Request to ${req.method} ${req.path} rejected — DB not initialized`, {}, error as Error);
+        logger.error('HTTP', 'Session init failed waiting for initialization', {}, error as Error);
         res.status(503).json({
           error: 'Service initializing',
           message: 'Database is still initializing, please retry'
         });
       }
     });
-
-    // Standard routes (registered AFTER guard middleware)
-    this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.openAICodexAgent, this.sessionEventBroadcaster, this));
-    this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
-    this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
-    this.server.registerRoutes(new LogsRoutes());
-    this.server.registerRoutes(new MemoryRoutes(this.dbManager, 'claude-mem'));
   }
 
   /**

@@ -91,10 +91,13 @@ function recordDebounceTimestamp(contentSessionId: string): void {
 export const sessionInitHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
     // Ensure worker is running before any other logic
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) {
-      // Worker not available - skip session init gracefully
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    await ensureWorkerRunning();
+
+    const { sessionId, cwd, prompt } = input;
+
+    // Gracefully handle empty prompts (user submitted blank input)
+    if (!prompt || !prompt.trim()) {
+      return { continue: true, suppressOutput: true };
     }
 
     const { sessionId, cwd, prompt: rawPrompt } = input;
