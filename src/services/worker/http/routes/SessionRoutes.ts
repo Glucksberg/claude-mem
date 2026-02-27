@@ -14,7 +14,8 @@ import { DatabaseManager } from '../../DatabaseManager.js';
 import { SDKAgent } from '../../SDKAgent.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from '../../GeminiAgent.js';
 import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from '../../OpenRouterAgent.js';
-import { OpenCodeAgent, isOpenCodeSelected, isOpenCodeAvailable } from '../../OpenCodeAgent.js';
+import { OpenAICodexAgent, isOpenAICodexAvailable } from '../../OpenAICodexAgent.js';
+import { MoonshotAgent, isMoonshotSelected, isMoonshotAvailable } from '../../MoonshotAgent.js';
 import type { WorkerService } from '../../../worker-service.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { SessionEventBroadcaster } from '../../events/SessionEventBroadcaster.js';
@@ -35,7 +36,8 @@ export class SessionRoutes extends BaseRouteHandler {
     private sdkAgent: SDKAgent,
     private geminiAgent: GeminiAgent,
     private openRouterAgent: OpenRouterAgent,
-    private openCodeAgent: OpenCodeAgent,
+    private openAICodexAgent: OpenAICodexAgent,
+    private moonshotAgent: MoonshotAgent,
     private eventBroadcaster: SessionEventBroadcaster,
     private workerService: WorkerService
   ) {
@@ -53,29 +55,27 @@ export class SessionRoutes extends BaseRouteHandler {
    * Note: Session linking via contentSessionId allows provider switching mid-session.
    * The conversationHistory on ActiveSession maintains context across providers.
    */
-  private getActiveAgent(): SDKAgent | GeminiAgent | OpenRouterAgent | OpenCodeAgent {
-    if (isOpenRouterSelected()) {
-      if (isOpenRouterAvailable()) {
-        logger.debug('SESSION', 'Using OpenRouter agent');
-        return this.openRouterAgent;
-      } else {
-        throw new Error('OpenRouter provider selected but no API key configured. Set CLAUDE_MEM_OPENROUTER_API_KEY in settings or OPENROUTER_API_KEY environment variable.');
-      }
+  /**
+   * Resolve which provider string to use for a given session.
+   * If the session originates from OpenClaw (contentSessionId starts with 'openclaw-')
+   * AND CLAUDE_MEM_OPENCLAW_PROVIDER is configured, that takes precedence.
+   * Otherwise falls back to the global CLAUDE_MEM_PROVIDER.
+   */
+  private resolveProviderForSession(contentSessionId?: string): string {
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    if (contentSessionId?.startsWith('openclaw-') && settings.CLAUDE_MEM_OPENCLAW_PROVIDER) {
+      return settings.CLAUDE_MEM_OPENCLAW_PROVIDER;
     }
-    if (isOpenCodeSelected()) {
-      if (isOpenCodeAvailable()) {
-        logger.debug('SESSION', 'Using OpenCode agent');
-        return this.openCodeAgent;
-      } else {
-        throw new Error('OpenCode provider selected but not available.');
-      }
-    }
-    if (isGeminiSelected()) {
-      if (isGeminiAvailable()) {
-        logger.debug('SESSION', 'Using Gemini agent');
-        return this.geminiAgent;
-      } else {
-        throw new Error('Gemini provider selected but no API key configured. Set CLAUDE_MEM_GEMINI_API_KEY in settings or GEMINI_API_KEY environment variable.');
+    return settings.CLAUDE_MEM_PROVIDER || 'claude';
+  }
+
+  private getActiveAgent(contentSessionId?: string): SDKAgent | GeminiAgent | OpenRouterAgent | OpenAICodexAgent | MoonshotAgent {
+    const provider = this.resolveProviderForSession(contentSessionId);
+
+    if (provider === 'openai-codex') {
+      if (isOpenAICodexAvailable()) {
+        logger.debug('SESSION', 'Using OpenAI Codex agent', { contentSessionId });
+        return this.openAICodexAgent;
       }
       throw new Error('OpenAI Codex provider selected but no OAuth credentials found. Run `openclaw auth` to authenticate with your ChatGPT account.');
     }
@@ -93,20 +93,26 @@ export class SessionRoutes extends BaseRouteHandler {
       }
       throw new Error('Gemini provider selected but no API key configured. Set CLAUDE_MEM_GEMINI_API_KEY in settings or GEMINI_API_KEY environment variable.');
     }
+    if (provider === 'moonshot' || provider === 'kimi' || provider === 'moonshot-ai') {
+      if (isMoonshotAvailable()) {
+        logger.debug('SESSION', 'Using Moonshot agent', { contentSessionId });
+        return this.moonshotAgent;
+      }
+      throw new Error('Moonshot provider selected but no API key configured. Set CLAUDE_MEM_MOONSHOT_API_KEY in settings or MOONSHOT_API_KEY environment variable.');
+    }
     return this.sdkAgent;
   }
 
   /**
    * Get the currently selected provider name for a session.
    */
-  private getSelectedProvider(): 'claude' | 'gemini' | 'openrouter' | 'opencode' {
-    if (isOpenRouterSelected() && isOpenRouterAvailable()) {
-      return 'openrouter';
-    }
-    if (isOpenCodeSelected() && isOpenCodeAvailable()) {
-      return 'opencode';
-    }
-    return (isGeminiSelected() && isGeminiAvailable()) ? 'gemini' : 'claude';
+  private getSelectedProvider(contentSessionId?: string): 'claude' | 'gemini' | 'openrouter' | 'openai-codex' | 'moonshot' {
+    const provider = this.resolveProviderForSession(contentSessionId);
+    if (provider === 'openai-codex' && isOpenAICodexAvailable()) return 'openai-codex';
+    if (provider === 'openrouter' && isOpenRouterAvailable()) return 'openrouter';
+    if (provider === 'gemini' && isGeminiAvailable()) return 'gemini';
+    if ((provider === 'moonshot' || provider === 'kimi' || provider === 'moonshot-ai') && isMoonshotAvailable()) return 'moonshot';
+    return 'claude';
   }
 
   /**
@@ -143,7 +149,7 @@ export class SessionRoutes extends BaseRouteHandler {
       return;
     }
 
-    const selectedProvider = forcedProvider ?? this.getSelectedProvider();
+    const selectedProvider = this.getSelectedProvider(session.contentSessionId);
 
     // Start generator if not running
     if (!session.generatorPromise) {
@@ -190,7 +196,7 @@ export class SessionRoutes extends BaseRouteHandler {
    */
   private startGeneratorWithProvider(
     session: ReturnType<typeof this.sessionManager.getSession>,
-    provider: 'claude' | 'gemini' | 'openrouter' | 'opencode',
+    provider: 'claude' | 'gemini' | 'openrouter' | 'openai-codex' | 'moonshot',
     source: string
   ): void {
     if (!session) return;
@@ -205,14 +211,15 @@ export class SessionRoutes extends BaseRouteHandler {
       session.abortController = new AbortController();
     }
 
-    const agent = provider === 'openrouter'
-      ? this.openRouterAgent
-      : (provider === 'gemini'
-        ? this.geminiAgent
-        : (provider === 'opencode' ? this.openCodeAgent : this.sdkAgent));
-    const agentName = provider === 'openrouter'
-      ? 'OpenRouter'
-      : (provider === 'gemini' ? 'Gemini' : (provider === 'opencode' ? 'OpenCode' : 'Claude SDK'));
+    // Select agent deterministically from the provider arg (already resolved by caller)
+    // to guarantee session.currentProvider matches the actual agent being used.
+    const agent =
+      provider === 'openai-codex' ? this.openAICodexAgent :
+      provider === 'moonshot'     ? this.moonshotAgent    :
+      provider === 'openrouter'   ? this.openRouterAgent  :
+      provider === 'gemini'       ? this.geminiAgent      :
+                                    this.sdkAgent;
+    const agentName = agent.constructor.name;
 
     // Use database count for accurate telemetry (in-memory array is always empty due to FK constraint fix)
     const pendingStore = this.sessionManager.getPendingMessageStore();

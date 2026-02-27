@@ -19,13 +19,20 @@ export interface SettingsDefaults {
   CLAUDE_MEM_WORKER_HOST: string;
   CLAUDE_MEM_SKIP_TOOLS: string;
   // AI Provider Configuration
-  CLAUDE_MEM_PROVIDER: string;
+  CLAUDE_MEM_PROVIDER: string;          // 'claude' | 'gemini' | 'openrouter' | 'openai-codex'
+  CLAUDE_MEM_OPENCLAW_PROVIDER: string; // Override provider for OpenClaw sessions (empty = use CLAUDE_MEM_PROVIDER)
   CLAUDE_MEM_CLAUDE_AUTH_METHOD: string;  // 'cli' | 'api' - how Claude provider authenticates
   CLAUDE_MEM_GEMINI_API_KEY: string;
   CLAUDE_MEM_GEMINI_MODEL: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash-preview'
   CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED: string;  // 'true' | 'false' - enable rate limiting for free tier
   CLAUDE_MEM_OPENROUTER_API_KEY: string;
   CLAUDE_MEM_OPENROUTER_MODEL: string;
+  // Moonshot AI (Kimi) Configuration
+  CLAUDE_MEM_MOONSHOT_API_KEY: string;
+  CLAUDE_MEM_MOONSHOT_MODEL: string;  // 'kimi-k2.5' | 'kimi-k2-0905-preview' | 'kimi-k2-turbo-preview' | 'kimi-k2-thinking'
+  CLAUDE_MEM_MOONSHOT_BASE_URL: string;  // Default: https://api.moonshot.ai/v1
+  CLAUDE_MEM_MOONSHOT_MAX_CONTEXT_MESSAGES: string;
+  CLAUDE_MEM_MOONSHOT_MAX_TOKENS: string;
   // OpenAI Codex OAuth provider
   CLAUDE_MEM_OPENAI_CODEX_MODEL: string;        // Model to use (default: gpt-4o)
   CLAUDE_MEM_OPENAI_CODEX_AGENT_DIR: string;    // Override path to auth-profiles.json dir
@@ -112,8 +119,12 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_OPENROUTER_APP_NAME: 'claude-mem',  // App name for OpenRouter analytics
     CLAUDE_MEM_OPENROUTER_MAX_CONTEXT_MESSAGES: '20',  // Max messages in context window
     CLAUDE_MEM_OPENROUTER_MAX_TOKENS: '100000',  // Max estimated tokens (~100k safety limit)
-    CLAUDE_MEM_OPENCODE_BASE_URL: 'http://127.0.0.1:4096',
-    CLAUDE_MEM_OPENCODE_MODE: 'sdk_agent',
+    // Moonshot AI (Kimi) Configuration
+    CLAUDE_MEM_MOONSHOT_API_KEY: '',  // Empty by default, can be set via UI or env
+    CLAUDE_MEM_MOONSHOT_MODEL: 'kimi-k2.5',  // Default Moonshot model (Kimi K2.5)
+    CLAUDE_MEM_MOONSHOT_BASE_URL: 'https://api.moonshot.ai/v1',  // Moonshot API endpoint
+    CLAUDE_MEM_MOONSHOT_MAX_CONTEXT_MESSAGES: '50',  // Kimi supports 256k context
+    CLAUDE_MEM_MOONSHOT_MAX_TOKENS: '200000',  // ~200k tokens max context
     // System Configuration
     CLAUDE_MEM_DATA_DIR: join(homedir(), '.claude-mem'),
     CLAUDE_MEM_LOG_LEVEL: 'INFO',
