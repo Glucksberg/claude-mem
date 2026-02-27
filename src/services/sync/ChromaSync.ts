@@ -435,7 +435,19 @@ export class ChromaSync {
   private safeJsonParse(value: string | null, fallback: any[] = [], context?: { field: string; obsId: number }): any {
     if (!value) return fallback;
     try {
-      return JSON.parse(value);
+      // Use WASM backend and uint8 quantization to reduce embedding memory footprint.
+      // Same model (all-MiniLM-L6-v2), but quantized weights significantly lower RSS.
+      const { DefaultEmbeddingFunction } = await import('@chroma-core/default-embed');
+      const embeddingFunction = new DefaultEmbeddingFunction({ wasm: true, dtype: 'uint8' });
+
+      this.collection = await this.chromaClient.getOrCreateCollection({
+        name: this.collectionName,
+        embeddingFunction
+      });
+
+      logger.debug('CHROMA_SYNC', 'Collection ready', {
+        collection: this.collectionName
+      });
     } catch (error) {
       // Check if this is a connection error - don't try to create collection
       const errorMessage = error instanceof Error ? error.message : String(error);
