@@ -125,6 +125,7 @@ import { SettingsRoutes } from './worker/http/routes/SettingsRoutes.js';
 import { LogsRoutes } from './worker/http/routes/LogsRoutes.js';
 import { MemoryRoutes } from './worker/http/routes/MemoryRoutes.js';
 import { FeedRoutes } from './worker/http/routes/FeedRoutes.js';
+import { SessionRegistryRoutes } from './worker/http/routes/SessionRegistryRoutes.js';
 
 // Feed daemon
 import { FeedDaemon } from './feed/FeedDaemon.js';
@@ -369,6 +370,7 @@ export class WorkerService {
     this.server.registerRoutes(new LogsRoutes());
     this.server.registerRoutes(new MemoryRoutes(this.dbManager, 'claude-mem'));
     this.server.registerRoutes(new FeedRoutes(this.feedDaemon, this.sseBroadcaster));
+    this.server.registerRoutes(new SessionRegistryRoutes());
   }
 
   /**
