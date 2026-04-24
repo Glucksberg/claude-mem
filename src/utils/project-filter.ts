@@ -6,6 +6,29 @@
  */
 
 import { homedir } from 'os';
+import path from 'path';
+import { OBSERVER_SESSIONS_DIR } from '../shared/paths.js';
+
+function normalizeForPathComparison(projectPath: string): string {
+  return path.resolve(projectPath).replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+/**
+ * Internal Claude-Mem observer sessions must never be observed by Claude-Mem.
+ * Otherwise Claude Code hooks capture the memory agent's own prompts and create
+ * recursive "observer observing observer" sessions.
+ */
+export function isInternalObserverSessionPath(projectPath: string | null | undefined): boolean {
+  if (!projectPath || !projectPath.trim()) {
+    return false;
+  }
+
+  const normalizedProjectPath = normalizeForPathComparison(projectPath);
+  const normalizedObserverDir = normalizeForPathComparison(OBSERVER_SESSIONS_DIR);
+
+  return normalizedProjectPath === normalizedObserverDir
+    || normalizedProjectPath.startsWith(`${normalizedObserverDir}/`);
+}
 
 /**
  * Convert a glob pattern to a regular expression
@@ -44,6 +67,10 @@ function globToRegex(pattern: string): RegExp {
  * @returns true if path should be excluded
  */
 export function isProjectExcluded(projectPath: string, exclusionPatterns: string): boolean {
+  if (isInternalObserverSessionPath(projectPath)) {
+    return true;
+  }
+
   if (!exclusionPatterns || !exclusionPatterns.trim()) {
     return false;
   }
@@ -65,7 +92,6 @@ export function isProjectExcluded(projectPath: string, exclusionPatterns: string
       }
     } catch (error: unknown) {
       // Invalid pattern, skip it
-      console.warn(`[project-filter] Invalid exclusion pattern "${pattern}":`, error instanceof Error ? error.message : String(error));
       continue;
     }
   }

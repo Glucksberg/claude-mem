@@ -6,11 +6,18 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { isProjectExcluded } from '../../src/utils/project-filter.js';
+import { isInternalObserverSessionPath, isProjectExcluded } from '../../src/utils/project-filter.js';
 import { homedir } from 'os';
+import path from 'path';
+import { OBSERVER_SESSIONS_DIR } from '../../src/shared/paths.js';
 
 describe('Project Filter', () => {
   describe('isProjectExcluded', () => {
+    it('always excludes Claude-Mem internal observer sessions', () => {
+      expect(isProjectExcluded(OBSERVER_SESSIONS_DIR, '')).toBe(true);
+      expect(isProjectExcluded(path.join(OBSERVER_SESSIONS_DIR, 'nested'), '')).toBe(true);
+    });
+
     describe('with empty patterns', () => {
       it('returns false for empty pattern string', () => {
         expect(isProjectExcluded('/Users/test/project', '')).toBe(false);
@@ -91,6 +98,22 @@ describe('Project Filter', () => {
         expect(isProjectExcluded('/var/tmp/test', patterns)).toBe(true);
         expect(isProjectExcluded('/home/user/tmp', patterns)).toBe(false);
       });
+    });
+  });
+
+  describe('isInternalObserverSessionPath', () => {
+    it('matches the observer session directory and children', () => {
+      expect(isInternalObserverSessionPath(OBSERVER_SESSIONS_DIR)).toBe(true);
+      expect(isInternalObserverSessionPath(path.join(OBSERVER_SESSIONS_DIR, '.claude'))).toBe(true);
+    });
+
+    it('does not match paths that merely share the same prefix', () => {
+      expect(isInternalObserverSessionPath(`${OBSERVER_SESSIONS_DIR}-backup`)).toBe(false);
+    });
+
+    it('returns false for empty input', () => {
+      expect(isInternalObserverSessionPath('')).toBe(false);
+      expect(isInternalObserverSessionPath(undefined)).toBe(false);
     });
   });
 });

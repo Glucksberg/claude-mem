@@ -13,6 +13,7 @@ import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js'
 import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { isInternalObserverSessionPath } from '../../utils/project-filter.js';
 
 async function sendSessionCompleteRequest(sessionId: string, platformSource: string): Promise<void> {
   const response = await workerHttpRequest('/api/sessions/complete', {
@@ -31,6 +32,14 @@ async function sendSessionCompleteRequest(sessionId: string, platformSource: str
 
 export const sessionCompleteHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
+    if (isInternalObserverSessionPath(input.cwd)) {
+      logger.debug('HOOK', 'session-complete: Skipping internal observer session', {
+        sessionId: input.sessionId,
+        cwd: input.cwd
+      });
+      return { continue: true, suppressOutput: true };
+    }
+
     // Ensure worker is running
     const workerReady = await ensureWorkerRunning();
     if (!workerReady) {

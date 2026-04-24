@@ -12,6 +12,7 @@ import { logger } from '../../utils/logger.js';
 import { extractLastMessage } from '../../shared/transcript-parser.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { isInternalObserverSessionPath } from '../../utils/project-filter.js';
 
 const SUMMARIZE_TIMEOUT_MS = 5000;
 
@@ -27,6 +28,14 @@ export const summarizeHandler: EventHandler = {
         sessionId: input.sessionId,
         agentId: input.agentId,
         agentType: input.agentType
+      });
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
+
+    if (isInternalObserverSessionPath(input.cwd)) {
+      logger.debug('HOOK', 'Skipping summary: internal observer session', {
+        sessionId: input.sessionId,
+        cwd: input.cwd
       });
       return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }

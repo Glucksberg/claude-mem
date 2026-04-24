@@ -7,7 +7,7 @@
  * - SessionManager.getSession returns undefined for uninitialized sessions
  * - SessionManager.getSession returns session after initialization
  */
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll, spyOn, mock } from 'bun:test';
 import { homedir } from 'os';
 import { join } from 'path';
 
@@ -40,6 +40,8 @@ mock.module('../../src/shared/worker-utils.js', () => ({
 
 mock.module('../../src/utils/project-filter.js', () => ({
   isProjectExcluded: () => false,
+  isInternalObserverSessionPath: (projectPath: string | null | undefined) =>
+    Boolean(projectPath?.includes('observer-sessions')),
 }));
 
 // Now import after mocks
@@ -60,6 +62,10 @@ beforeEach(() => {
 
 afterEach(() => {
   loggerSpies.forEach(spy => spy.mockRestore());
+});
+
+afterAll(() => {
+  mock.restore();
 });
 
 describe('Context Re-Injection Guard (#1079)', () => {

@@ -10,6 +10,7 @@ import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-util
 import { logger } from '../../utils/logger.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { isInternalObserverSessionPath } from '../../utils/project-filter.js';
 
 async function sendFileEditObservation(requestBody: string, filePath: string): Promise<void> {
   const response = await workerHttpRequest('/api/sessions/observations', {
@@ -28,6 +29,14 @@ async function sendFileEditObservation(requestBody: string, filePath: string): P
 
 export const fileEditHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
+    if (isInternalObserverSessionPath(input.cwd)) {
+      logger.debug('HOOK', 'Skipping file edit observation: internal observer session', {
+        sessionId: input.sessionId,
+        cwd: input.cwd
+      });
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
+
     // Ensure worker is running before any other logic
     const workerReady = await ensureWorkerRunning();
     if (!workerReady) {

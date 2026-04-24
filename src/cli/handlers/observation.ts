@@ -8,7 +8,7 @@ import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js'
 import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
-import { isProjectExcluded } from '../../utils/project-filter.js';
+import { isInternalObserverSessionPath, isProjectExcluded } from '../../utils/project-filter.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
@@ -30,15 +30,16 @@ async function sendObservationToWorker(requestBody: string, toolName: string): P
 
 export const observationHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
-    // Ensure worker is running before any other logic
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) {
-      // Worker not available - skip observation gracefully
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-    }
-
     const { sessionId, cwd, toolName, toolInput, toolResponse } = input;
     const platformSource = normalizePlatformSource(input.platform);
+
+    if (isInternalObserverSessionPath(cwd)) {
+      logger.debug('HOOK', 'Skipping observation: internal observer session', {
+        sessionId,
+        cwd
+      });
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
 
     if (!toolName) {
       // No tool name provided - skip observation gracefully
@@ -59,6 +60,14 @@ export const observationHandler: EventHandler = {
     if (isProjectExcluded(cwd, settings.CLAUDE_MEM_EXCLUDED_PROJECTS)) {
       logger.debug('HOOK', 'Project excluded from tracking, skipping observation', { cwd, toolName });
       return { continue: true, suppressOutput: true };
+    }
+
+    // Ensure worker is running after local skip checks so internal observer
+    // sessions cannot bootstrap the worker recursively.
+    const workerReady = await ensureWorkerRunning();
+    if (!workerReady) {
+      // Worker not available - skip observation gracefully
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
     // Send to worker - worker handles privacy check and database operations

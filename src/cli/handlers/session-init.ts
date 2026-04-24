@@ -9,7 +9,7 @@ import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-util
 import { getProjectContext } from '../../utils/project-name.js';
 import { logger } from '../../utils/logger.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
-import { isProjectExcluded } from '../../utils/project-filter.js';
+import { isInternalObserverSessionPath, isProjectExcluded } from '../../utils/project-filter.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
@@ -37,15 +37,13 @@ async function fetchSemanticContext(
 
 export const sessionInitHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
-    // Ensure worker is running before any other logic
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) {
-      // Worker not available - skip session init gracefully
-      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
-    }
-
     const { sessionId, prompt: rawPrompt } = input;
     const cwd = input.cwd ?? process.cwd();  // Match context.ts fallback (#1918)
+
+    if (isInternalObserverSessionPath(cwd)) {
+      logger.debug('HOOK', 'session-init: Skipping internal observer session', { cwd });
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
+    }
 
     // Guard: Codex CLI and other platforms may not provide a session_id (#744)
     if (!sessionId) {
@@ -58,6 +56,14 @@ export const sessionInitHandler: EventHandler = {
     if (cwd && isProjectExcluded(cwd, settings.CLAUDE_MEM_EXCLUDED_PROJECTS)) {
       logger.info('HOOK', 'Project excluded from tracking', { cwd });
       return { continue: true, suppressOutput: true };
+    }
+
+    // Ensure worker is running after local skip checks so internal observer
+    // sessions cannot bootstrap the worker recursively.
+    const workerReady = await ensureWorkerRunning();
+    if (!workerReady) {
+      // Worker not available - skip session init gracefully
+      return { continue: true, suppressOutput: true, exitCode: HOOK_EXIT_CODES.SUCCESS };
     }
 
     // Handle image-only prompts (where text prompt is empty/undefined)

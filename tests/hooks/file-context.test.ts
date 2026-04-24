@@ -1,5 +1,5 @@
 // Tests for file-context cache validation fix (#1719)
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll, spyOn, mock } from 'bun:test';
 import { mkdtempSync, writeFileSync, utimesSync, rmSync } from 'fs';
 import { tmpdir, homedir } from 'os';
 import { join } from 'path';
@@ -36,6 +36,8 @@ mock.module('../../src/utils/project-name.js', () => ({
 
 mock.module('../../src/utils/project-filter.js', () => ({
   isProjectExcluded: () => false,
+  isInternalObserverSessionPath: (projectPath: string | null | undefined) =>
+    Boolean(projectPath?.includes('observer-sessions')),
 }));
 
 // Import after mocks
@@ -87,6 +89,10 @@ afterEach(() => {
     fetchSpy = null;
   }
   try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+});
+
+afterAll(() => {
+  mock.restore();
 });
 
 describe('fileContextHandler — cache validation fix (#1719)', () => {
