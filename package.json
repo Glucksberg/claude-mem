@@ -125,6 +125,7 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.138",
     "@better-auth/api-key": "^1.6.9",
+    "@earendil-works/pi-ai": "^0.74.0",
     "@clack/prompts": "^1.3.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "ansi-to-html": "^0.7.2",

@@ -277,6 +277,9 @@ describe('SettingsDefaultsManager', () => {
       expect(defaults.CLAUDE_MEM_PROVIDER).toBeDefined();
       expect(defaults.CLAUDE_MEM_GEMINI_API_KEY).toBeDefined();
       expect(defaults.CLAUDE_MEM_OPENROUTER_API_KEY).toBeDefined();
+      expect(defaults.CLAUDE_MEM_OPENAI_CODEX_MODEL).toBe('gpt-5.4-mini');
+      expect(defaults.CLAUDE_MEM_OPENAI_CODEX_MAX_CONTEXT_MESSAGES).toBe('20');
+      expect(defaults.CLAUDE_MEM_OPENAI_CODEX_MAX_TOKENS).toBe('100000');
 
       expect(defaults.CLAUDE_MEM_DATA_DIR).toBeDefined();
       expect(defaults.CLAUDE_MEM_LOG_LEVEL).toBeDefined();
@@ -285,7 +288,7 @@ describe('SettingsDefaultsManager', () => {
 
   describe('get', () => {
     it('should return default value for key', () => {
-      expect(SettingsDefaultsManager.get('CLAUDE_MEM_MODEL')).toBe('claude-sonnet-4-6');
+      expect(SettingsDefaultsManager.get('CLAUDE_MEM_MODEL')).toBe('claude-haiku-4-5-20251001');
       const expectedPort = String(37700 + ((process.getuid?.() ?? 77) % 100));
       expect(SettingsDefaultsManager.get('CLAUDE_MEM_WORKER_PORT')).toBe(expectedPort);
     });
