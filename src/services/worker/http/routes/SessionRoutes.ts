@@ -23,6 +23,7 @@ import { normalizePlatformSource } from '../../../../shared/platform-source.js';
 import { handleGeneratorExit } from '../../session/GeneratorExitHandler.js';
 import { SessionCompletionHandler } from '../../session/SessionCompletionHandler.js';
 import { getUptimeSeconds } from '../../../../shared/uptime.js';
+import { USER_PROMPT_DEDUPE_WINDOW_MS } from '../../../../shared/user-prompts.js';
 
 const MAX_USER_PROMPT_BYTES = 256 * 1024;
 const USER_PROMPT_DEDUPE_WINDOW_MS = 10_000;
