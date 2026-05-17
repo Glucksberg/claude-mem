@@ -83,7 +83,12 @@ function openDatabaseWithSchemaRepair(dbPath: string): Database {
   repairSchemaFileWithPython(dbPath);
 
   const repairedDb = new Database(dbPath, { create: true, readwrite: true });
-  assertSchemaReadable(repairedDb);
+  try {
+    assertSchemaReadable(repairedDb);
+  } catch (error) {
+    repairedDb.close();
+    throw error;
+  }
   return repairedDb;
 }
 
