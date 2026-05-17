@@ -1685,8 +1685,8 @@ export class SessionStore {
     const normalizedPlatformSource = resolved.platformSource ?? DEFAULT_PLATFORM_SOURCE;
 
     const existing = this.db.prepare(`
-      SELECT id, platform_source FROM sdk_sessions WHERE content_session_id = ?
-    `).get(contentSessionId) as { id: number; platform_source: string | null } | undefined;
+      SELECT id, platform_source, status FROM sdk_sessions WHERE content_session_id = ?
+    `).get(contentSessionId) as { id: number; platform_source: string | null; status: string } | undefined;
 
     if (existing) {
       if (project) {
@@ -1718,6 +1718,19 @@ export class SessionStore {
             `Platform source conflict for session ${contentSessionId}: existing=${storedPlatformSource}, received=${resolved.platformSource}`
           );
         }
+      }
+      if (existing.status === 'completed') {
+        this.db.prepare(`
+          UPDATE sdk_sessions
+          SET status = 'active',
+              completed_at = NULL,
+              completed_at_epoch = NULL
+          WHERE id = ?
+        `).run(existing.id);
+        logger.debug('DB', 'Reactivated completed SDK session for resumed content session', {
+          sessionId: existing.id,
+          contentSessionId
+        });
       }
       return existing.id;
     }

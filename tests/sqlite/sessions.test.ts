@@ -48,6 +48,33 @@ describe('Sessions Module', () => {
 
       expect(sessionId1).not.toBe(sessionId2);
     });
+
+    it('should reactivate completed sessions when the same content_session_id resumes', () => {
+      const sessionId = createSDKSession(db, 'resumed-session', 'project', 'prompt');
+      db.prepare(`
+        UPDATE sdk_sessions
+        SET status = 'completed',
+            completed_at = '2026-05-17T00:00:00.000Z',
+            completed_at_epoch = 1778976000000
+        WHERE id = ?
+      `).run(sessionId);
+
+      const resumedId = createSDKSession(db, 'resumed-session', 'project', 'next prompt');
+      const session = db.prepare(`
+        SELECT status, completed_at, completed_at_epoch
+        FROM sdk_sessions
+        WHERE id = ?
+      `).get(sessionId) as {
+        status: string;
+        completed_at: string | null;
+        completed_at_epoch: number | null;
+      };
+
+      expect(resumedId).toBe(sessionId);
+      expect(session?.status).toBe('active');
+      expect(session?.completed_at).toBeNull();
+      expect(session?.completed_at_epoch).toBeNull();
+    });
   });
 
   describe('getSessionById', () => {
