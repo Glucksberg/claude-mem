@@ -5,6 +5,8 @@ import { logger } from '../../utils/logger.js';
 import { OBSERVER_SESSIONS_PROJECT } from '../../shared/paths.js';
 import type { PaginatedResult, Observation, Summary, UserPrompt } from '../worker-types.js';
 
+const USER_PROMPT_DEDUPE_WINDOW_MS = 10_000;
+
 export class PaginationHelper {
   private dbManager: DatabaseManager;
 
@@ -200,6 +202,24 @@ export class PaginationHelper {
     if (conditions.length > 0) {
       query += ` WHERE ${conditions.join(' AND ')}`;
     }
+
+    query += `
+      AND NOT EXISTS (
+        SELECT 1
+        FROM user_prompts duplicate
+        WHERE duplicate.content_session_id = up.content_session_id
+          AND duplicate.prompt_text = up.prompt_text
+          AND (
+            duplicate.created_at_epoch > up.created_at_epoch
+            OR (
+              duplicate.created_at_epoch = up.created_at_epoch
+              AND duplicate.id > up.id
+            )
+          )
+          AND duplicate.created_at_epoch - up.created_at_epoch <= ?
+      )
+    `;
+    params.push(USER_PROMPT_DEDUPE_WINDOW_MS);
 
     query += ' ORDER BY up.created_at_epoch DESC LIMIT ? OFFSET ?';
     params.push(limit + 1, offset);

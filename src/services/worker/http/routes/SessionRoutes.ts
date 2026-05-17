@@ -25,6 +25,7 @@ import { SessionCompletionHandler } from '../../session/SessionCompletionHandler
 import { getUptimeSeconds } from '../../../../shared/uptime.js';
 
 const MAX_USER_PROMPT_BYTES = 256 * 1024;
+const USER_PROMPT_DEDUPE_WINDOW_MS = 10_000;
 
 export type SessionProviderId = 'claude' | 'gemini' | 'openrouter' | 'openai-codex';
 
@@ -409,6 +410,31 @@ export class SessionRoutes extends BaseRouteHandler {
         promptNumber,
         skipped: true,
         reason: 'private'
+      });
+      return;
+    }
+
+    const duplicatePrompt = store.findRecentDuplicateUserPrompt(
+      contentSessionId,
+      cleanedPrompt,
+      USER_PROMPT_DEDUPE_WINDOW_MS
+    );
+
+    if (duplicatePrompt) {
+      const contextInjected = this.sessionManager.getSession(sessionDbId) !== undefined;
+      logger.debug('SESSION', 'Duplicate user prompt skipped', {
+        sessionId: sessionDbId,
+        promptNumber: duplicatePrompt.prompt_number,
+        duplicatePromptId: duplicatePrompt.id,
+        contextInjected
+      });
+
+      res.json({
+        sessionDbId,
+        promptNumber: duplicatePrompt.prompt_number,
+        skipped: true,
+        reason: 'duplicate',
+        contextInjected
       });
       return;
     }
