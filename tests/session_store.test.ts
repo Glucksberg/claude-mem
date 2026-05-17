@@ -29,6 +29,27 @@ describe('SessionStore', () => {
     expect(store.getPromptNumberFromUserPrompts(claudeId)).toBe(2);
   });
 
+  it('should reactivate completed sessions when they receive new work', () => {
+    const sdkId = store.createSDKSession('resumed-content-session', 'test-project', 'initial prompt');
+    store.markSessionCompleted(sdkId);
+
+    const resumedId = store.createSDKSession('resumed-content-session', 'test-project', 'next prompt');
+    const session = store.db.prepare(`
+      SELECT status, completed_at, completed_at_epoch
+      FROM sdk_sessions
+      WHERE id = ?
+    `).get(sdkId) as {
+      status: string;
+      completed_at: string | null;
+      completed_at_epoch: number | null;
+    };
+
+    expect(resumedId).toBe(sdkId);
+    expect(session?.status).toBe('active');
+    expect(session?.completed_at).toBeNull();
+    expect(session?.completed_at_epoch).toBeNull();
+  });
+
   it('should store observation with timestamp override', () => {
     const claudeId = 'claude-sess-obs';
     const memoryId = 'memory-sess-obs';
