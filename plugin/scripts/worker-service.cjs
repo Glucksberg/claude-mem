@@ -566,13 +566,15 @@ ${i.stack}`:` ${i.message}`;else if(this.getLevel()===0&&typeof i=="object")try{
             UPDATE sdk_sessions SET platform_source = ?
             WHERE content_session_id = ?
               AND COALESCE(platform_source, '') = ''
-          `).run(c.platformSource,e);else if(p!==c.platformSource)throw new Error(`Platform source conflict for session ${e}: existing=${p}, received=${c.platformSource}`)}return l.status==="completed"&&(this.db.prepare(`
+          `).run(c.platformSource,e);else if(p!==c.platformSource)throw new Error(`Platform source conflict for session ${e}: existing=${p}, received=${c.platformSource}`)}if(l.status==="completed"){let p=new Date;this.db.prepare(`
           UPDATE sdk_sessions
           SET status = 'active',
               completed_at = NULL,
-              completed_at_epoch = NULL
+              completed_at_epoch = NULL,
+              started_at = ?,
+              started_at_epoch = ?
           WHERE id = ?
-        `).run(l.id),A.debug("DB","Reactivated completed SDK session for resumed content session",{sessionId:l.id,contentSessionId:e})),l.id}return this.db.prepare(`
+        `).run(p.toISOString(),p.getTime(),l.id),A.debug("DB","Reactivated completed SDK session for resumed content session",{sessionId:l.id,contentSessionId:e})}return l.id}return this.db.prepare(`
       INSERT INTO sdk_sessions
       (content_session_id, memory_session_id, project, platform_source, user_prompt, custom_title, started_at, started_at_epoch, status)
       VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'active')

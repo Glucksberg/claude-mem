@@ -54,6 +54,8 @@ describe('Sessions Module', () => {
       db.prepare(`
         UPDATE sdk_sessions
         SET status = 'completed',
+            started_at = '2026-05-16T00:00:00.000Z',
+            started_at_epoch = 1778889600000,
             completed_at = '2026-05-17T00:00:00.000Z',
             completed_at_epoch = 1778976000000
         WHERE id = ?
@@ -61,17 +63,21 @@ describe('Sessions Module', () => {
 
       const resumedId = createSDKSession(db, 'resumed-session', 'project', 'next prompt');
       const session = db.prepare(`
-        SELECT status, completed_at, completed_at_epoch
+        SELECT status, started_at, started_at_epoch, completed_at, completed_at_epoch
         FROM sdk_sessions
         WHERE id = ?
       `).get(sessionId) as {
         status: string;
+        started_at: string;
+        started_at_epoch: number;
         completed_at: string | null;
         completed_at_epoch: number | null;
       };
 
       expect(resumedId).toBe(sessionId);
       expect(session?.status).toBe('active');
+      expect(session?.started_at).not.toBe('2026-05-16T00:00:00.000Z');
+      expect(session?.started_at_epoch).toBeGreaterThan(1778889600000);
       expect(session?.completed_at).toBeNull();
       expect(session?.completed_at_epoch).toBeNull();
     });

@@ -62,13 +62,16 @@ export function createSDKSession(
       }
     }
     if (existing.status === 'completed') {
+      const reactivateNow = new Date();
       db.prepare(`
         UPDATE sdk_sessions
         SET status = 'active',
             completed_at = NULL,
-            completed_at_epoch = NULL
+            completed_at_epoch = NULL,
+            started_at = ?,
+            started_at_epoch = ?
         WHERE id = ?
-      `).run(existing.id);
+      `).run(reactivateNow.toISOString(), reactivateNow.getTime(), existing.id);
       logger.debug('DB', 'Reactivated completed SDK session for resumed content session', {
         sessionId: existing.id,
         contentSessionId
