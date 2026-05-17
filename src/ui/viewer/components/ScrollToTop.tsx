@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 
 interface ScrollToTopProps {
-  targetRef: React.RefObject<HTMLDivElement>;
+  targetRef: React.RefObject<HTMLDivElement | null>;
 }
 
 export function ScrollToTop({ targetRef }: ScrollToTopProps) {
@@ -20,7 +20,7 @@ export function ScrollToTop({ targetRef }: ScrollToTopProps) {
       target.addEventListener('scroll', handleScroll);
       return () => target.removeEventListener('scroll', handleScroll);
     }
-  }, []); 
+  }, [targetRef]);
 
   const scrollToTop = () => {
     const target = targetRef.current;
