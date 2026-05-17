@@ -72,6 +72,7 @@ import { ClaudeProvider, classifyClaudeError } from './worker/ClaudeProvider.js'
 import type { WorkerRef } from './worker/agents/types.js';
 import { GeminiProvider, classifyGeminiError, isGeminiSelected, isGeminiAvailable } from './worker/GeminiProvider.js';
 import { OpenRouterProvider, classifyOpenRouterError, isOpenRouterSelected, isOpenRouterAvailable } from './worker/OpenRouterProvider.js';
+import { OpenAICodexProvider, classifyOpenAICodexError, isOpenAICodexSelected, isOpenAICodexAvailable } from './worker/OpenAICodexProvider.js';
 import { ClassifiedProviderError, isClassified, type ProviderErrorClass } from './worker/provider-errors.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
 import { SettingsManager } from './worker/SettingsManager.js';
@@ -129,6 +130,7 @@ export class WorkerService implements WorkerRef {
   private sdkAgent: ClaudeProvider;
   private geminiAgent: GeminiProvider;
   private openRouterAgent: OpenRouterProvider;
+  private openAICodexAgent: OpenAICodexProvider;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
@@ -160,6 +162,7 @@ export class WorkerService implements WorkerRef {
     this.sdkAgent = new ClaudeProvider(this.dbManager, this.sessionManager);
     this.geminiAgent = new GeminiProvider(this.dbManager, this.sessionManager);
     this.openRouterAgent = new OpenRouterProvider(this.dbManager, this.sessionManager);
+    this.openAICodexAgent = new OpenAICodexProvider(this.dbManager, this.sessionManager);
 
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
@@ -192,11 +195,17 @@ export class WorkerService implements WorkerRef {
       workerPath: __filename,
       getAiStatus: () => {
         let provider = 'claude';
-        if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
+        if (isOpenAICodexSelected()) provider = 'openai-codex';
+        else if (isOpenRouterSelected() && isOpenRouterAvailable()) provider = 'openrouter';
         else if (isGeminiSelected() && isGeminiAvailable()) provider = 'gemini';
+        const openAICodexAvailable = provider === 'openai-codex' && isOpenAICodexAvailable();
         return {
           provider,
-          authMethod: getAuthMethodDescription(),
+          authMethod: provider === 'openai-codex'
+            ? (openAICodexAvailable
+              ? 'OpenAI Codex OAuth profile'
+              : 'OpenAI Codex OAuth profile missing; run codex login')
+            : getAuthMethodDescription(),
           lastInteraction: this.lastAiInteraction
             ? {
                 timestamp: this.lastAiInteraction.timestamp,
@@ -260,7 +269,7 @@ export class WorkerService implements WorkerRef {
     });
 
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.completionHandler);
+    const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.openAICodexAgent, this.sessionEventBroadcaster, this, this.completionHandler);
     this.server.registerRoutes(sessionRoutes);
     attachIngestGeneratorStarter((sessionDbId, source) =>
       sessionRoutes.ensureGeneratorRunning(sessionDbId, source),
@@ -498,7 +507,10 @@ export class WorkerService implements WorkerRef {
     });
   }
 
-  private getActiveAgent(): ClaudeProvider | GeminiProvider | OpenRouterProvider {
+  private getActiveAgent(): ClaudeProvider | GeminiProvider | OpenRouterProvider | OpenAICodexProvider {
+    if (isOpenAICodexSelected()) {
+      return this.openAICodexAgent;
+    }
     if (isOpenRouterSelected() && isOpenRouterAvailable()) {
       return this.openRouterAgent;
     }
@@ -519,7 +531,7 @@ export class WorkerService implements WorkerRef {
    */
   private reclassifyAtDispatch(
     error: unknown,
-    agent: ClaudeProvider | GeminiProvider | OpenRouterProvider
+    agent: ClaudeProvider | GeminiProvider | OpenRouterProvider | OpenAICodexProvider
   ): ClassifiedProviderError | null {
     try {
       if (agent instanceof ClaudeProvider) {
@@ -531,6 +543,9 @@ export class WorkerService implements WorkerRef {
       }
       if (agent instanceof OpenRouterProvider) {
         return classifyOpenRouterError({ cause: error });
+      }
+      if (agent instanceof OpenAICodexProvider) {
+        return classifyOpenAICodexError({ cause: error });
       }
     } catch {
       // If the classifier itself throws, fall back to unclassified.
@@ -694,6 +709,22 @@ export class WorkerService implements WorkerRef {
       const syntheticId = `fallback-${sessionDbId}-${Date.now()}`;
       session.memorySessionId = syntheticId;
       this.dbManager.getSessionStore().updateMemorySessionId(sessionDbId, syntheticId);
+    }
+
+    if (isOpenAICodexSelected()) {
+      try {
+        await this.openAICodexAgent.startSession(session, this);
+        return;
+      } catch (e) {
+        if (e instanceof Error) {
+          logger.error('WORKER', 'Fallback OpenAI Codex failed; provider is selected, so no alternate provider will be used', {
+            sessionId: sessionDbId,
+          }, e);
+        } else {
+          logger.error('WORKER', 'OpenAI Codex fallback failed with non-Error; provider is selected, so no alternate provider will be used', { sessionId: sessionDbId }, new Error(String(e)));
+        }
+        throw e;
+      }
     }
 
     if (isGeminiAvailable()) {
@@ -1185,7 +1216,9 @@ async function main() {
       });
 
       const worker = new WorkerService();
-      worker.start().catch(async (error) => {
+      try {
+        await worker.start();
+      } catch (error) {
         const isPortConflict = error instanceof Error && (
           (error as NodeJS.ErrnoException).code === 'EADDRINUSE' ||
           /port.*in use|address.*in use/i.test(error.message)
@@ -1197,7 +1230,7 @@ async function main() {
         logger.failure('SYSTEM', 'Worker failed to start', {}, error as Error);
         removePidFile();
         process.exit(0);
-      });
+      }
     }
   }
 }
