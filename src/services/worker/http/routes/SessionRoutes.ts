@@ -26,7 +26,6 @@ import { getUptimeSeconds } from '../../../../shared/uptime.js';
 import { USER_PROMPT_DEDUPE_WINDOW_MS } from '../../../../shared/user-prompts.js';
 
 const MAX_USER_PROMPT_BYTES = 256 * 1024;
-const USER_PROMPT_DEDUPE_WINDOW_MS = 10_000;
 
 export type SessionProviderId = 'claude' | 'gemini' | 'openrouter' | 'openai-codex';
 

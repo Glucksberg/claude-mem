@@ -6,8 +6,6 @@ import { OBSERVER_SESSIONS_PROJECT } from '../../shared/paths.js';
 import { USER_PROMPT_DEDUPE_WINDOW_MS } from '../../shared/user-prompts.js';
 import type { PaginatedResult, Observation, Summary, UserPrompt } from '../worker-types.js';
 
-const USER_PROMPT_DEDUPE_WINDOW_MS = 10_000;
-
 export class PaginationHelper {
   private dbManager: DatabaseManager;
 
