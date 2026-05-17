@@ -1,10 +1,15 @@
 import { Database } from 'bun:sqlite';
+import { execFileSync } from 'child_process';
 import { DATA_DIR, DB_PATH, ensureDir } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import { MigrationRunner } from './migrations/runner.js';
 
 const SQLITE_MMAP_SIZE_BYTES = 256 * 1024 * 1024; 
 const SQLITE_CACHE_SIZE_PAGES = 10_000;
+const REPAIRABLE_SCHEMA_INDEXES = [
+  'idx_observations_content_hash',
+  'ux_observations_session_hash'
+];
 
 export interface Migration {
   version: number;
@@ -14,6 +19,79 @@ export interface Migration {
 
 let dbInstance: Database | null = null;
 
+function isMalformedSchemaError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('malformed database schema');
+}
+
+function assertSchemaReadable(db: Database): void {
+  db.query('SELECT name FROM sqlite_master WHERE type = "table" LIMIT 1').all();
+}
+
+function repairSchemaFileWithPython(dbPath: string): void {
+  const script = `
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+index_names = sys.argv[2:]
+
+conn = sqlite3.connect(db_path)
+try:
+    conn.execute("PRAGMA writable_schema = ON")
+    placeholders = ",".join("?" for _ in index_names)
+    conn.execute(
+        f"DELETE FROM sqlite_master WHERE type = 'index' AND name IN ({placeholders})",
+        index_names,
+    )
+    version = conn.execute("PRAGMA schema_version").fetchone()[0]
+    conn.execute(f"PRAGMA schema_version = {version + 1}")
+    conn.execute("PRAGMA writable_schema = OFF")
+    conn.commit()
+finally:
+    conn.close()
+`;
+
+  const errors: string[] = [];
+  for (const executable of ['python3', 'python']) {
+    try {
+      execFileSync(executable, ['-c', script, dbPath, ...REPAIRABLE_SCHEMA_INDEXES], {
+        stdio: 'pipe'
+      });
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(`${executable}: ${message}`);
+    }
+  }
+
+  throw new Error(`Unable to repair malformed SQLite schema with Python: ${errors.join('; ')}`);
+}
+
+function openDatabaseWithSchemaRepair(dbPath: string): Database {
+  const db = new Database(dbPath, { create: true, readwrite: true });
+  try {
+    assertSchemaReadable(db);
+    return db;
+  } catch (error) {
+    db.close();
+    if (!isMalformedSchemaError(error) || dbPath === ':memory:') {
+      throw error;
+    }
+  }
+
+  logger.warn('DB', 'Repairing malformed SQLite schema metadata before migration');
+  repairSchemaFileWithPython(dbPath);
+
+  const repairedDb = new Database(dbPath, { create: true, readwrite: true });
+  try {
+    assertSchemaReadable(repairedDb);
+  } catch (error) {
+    repairedDb.close();
+    throw error;
+  }
+  return repairedDb;
+}
+
 export class ClaudeMemDatabase {
   public db: Database;
 
@@ -22,7 +100,7 @@ export class ClaudeMemDatabase {
       ensureDir(DATA_DIR);
     }
 
-    this.db = new Database(dbPath, { create: true, readwrite: true });
+    this.db = openDatabaseWithSchemaRepair(dbPath);
 
     this.db.run('PRAGMA journal_mode = WAL');
     this.db.run('PRAGMA synchronous = NORMAL');
@@ -64,7 +142,7 @@ export class DatabaseManager {
 
     ensureDir(DATA_DIR);
 
-    this.db = new Database(DB_PATH, { create: true, readwrite: true });
+    this.db = openDatabaseWithSchemaRepair(DB_PATH);
 
     this.db.run('PRAGMA journal_mode = WAL');
     this.db.run('PRAGMA synchronous = NORMAL');

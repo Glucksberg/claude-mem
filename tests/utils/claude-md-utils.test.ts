@@ -9,6 +9,10 @@ mock.module('../../src/utils/logger.js', () => ({
     debug: () => {},
     warn: () => {},
     error: () => {},
+    failure: () => {},
+    dataIn: () => {},
+    dataOut: () => {},
+    success: () => {},
     formatTool: (toolName: string, toolInput?: any) => toolInput ? `${toolName}(...)` : toolName,
   },
 }));
@@ -523,7 +527,16 @@ describe('updateFolderClaudeMdFiles', () => {
   });
 
   it('should handle empty string paths gracefully with projectRoot', async () => {
-    const fetchMock = mock(() => Promise.resolve({ ok: true } as Response));
+    const apiResponse = {
+      content: [{
+        text: '| #123 | 4:30 PM | 🔵 | Test | ~100 |'
+      }]
+    };
+
+    const fetchMock = mock(() => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve(apiResponse)
+    } as Response));
     global.fetch = fetchMock;
 
     await updateFolderClaudeMdFiles(
