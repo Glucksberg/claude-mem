@@ -25,7 +25,7 @@ class MemoryStorage {
 const memStore = new MemoryStorage();
 (globalThis as unknown as { localStorage: MemoryStorage }).localStorage = memStore;
 
-const STORAGE_KEY = 'claude-mem-welcome-dismissed-v2';
+const STORAGE_KEY = 'claude-mem-welcome-dismissed-v3';
 const LEGACY_KEY = 'claude-mem-welcome-dismissed-v1';
 
 import {
@@ -33,7 +33,7 @@ import {
   setStoredWelcomeDismissed,
 } from '../../src/ui/viewer/components/WelcomeCard';
 
-describe('WelcomeCard storage helpers (v2 key)', () => {
+describe('WelcomeCard storage helpers (v3 key)', () => {
   beforeEach(() => {
     memStore.clear();
   });
@@ -42,13 +42,13 @@ describe('WelcomeCard storage helpers (v2 key)', () => {
     expect(getStoredWelcomeDismissed()).toBe(false);
   });
 
-  it('persists dismissal under the v2 key', () => {
+  it('persists dismissal under the v3 key', () => {
     setStoredWelcomeDismissed(true);
     expect(memStore.getItem(STORAGE_KEY)).toBe('true');
     expect(getStoredWelcomeDismissed()).toBe(true);
   });
 
-  it('clears the v2 key when dismissed=false', () => {
+  it('clears the v3 key when dismissed=false', () => {
     setStoredWelcomeDismissed(true);
     setStoredWelcomeDismissed(false);
     expect(memStore.getItem(STORAGE_KEY)).toBeNull();

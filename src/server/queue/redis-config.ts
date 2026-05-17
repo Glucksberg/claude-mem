@@ -19,6 +19,15 @@ export interface RedisQueueConfig {
   connection: RedisOptions;
 }
 
+const DEFAULT_QUEUE_SETTINGS: Partial<Record<keyof SettingsDefaults, string>> = {
+  CLAUDE_MEM_QUEUE_ENGINE: 'sqlite',
+  CLAUDE_MEM_REDIS_MODE: 'external',
+  CLAUDE_MEM_REDIS_URL: '',
+  CLAUDE_MEM_REDIS_HOST: '127.0.0.1',
+  CLAUDE_MEM_REDIS_PORT: '6379',
+  CLAUDE_MEM_QUEUE_REDIS_PREFIX: 'claude_mem',
+};
+
 export function getObservationQueueEngineName(): ObservationQueueEngineName {
   const raw = getQueueSetting('CLAUDE_MEM_QUEUE_ENGINE').trim().toLowerCase();
   if (raw === 'sqlite' || raw === 'bullmq') {
@@ -52,9 +61,16 @@ function getQueueSetting(key: keyof SettingsDefaults): string {
     return process.env[key]!;
   }
   if (existsSync(USER_SETTINGS_PATH)) {
-    return SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH)[key];
+    const fileValue = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH)[key];
+    if (typeof fileValue === 'string') {
+      return fileValue;
+    }
   }
-  return SettingsDefaultsManager.get(key);
+  const defaultValue = SettingsDefaultsManager.get(key);
+  if (typeof defaultValue === 'string' && defaultValue.length > 0) {
+    return defaultValue;
+  }
+  return DEFAULT_QUEUE_SETTINGS[key] ?? '';
 }
 
 function normalizeRedisMode(value: string): RedisMode {

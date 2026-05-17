@@ -6,10 +6,28 @@ mock.module('../../../src/shared/SettingsDefaultsManager.js', () => ({
   SettingsDefaultsManager: {
     get: (key: string) => {
       if (key === 'CLAUDE_MEM_DATA_DIR') return join(homedir(), '.claude-mem');
+      if (key === 'CLAUDE_MEM_QUEUE_ENGINE') return 'sqlite';
+      if (key === 'CLAUDE_MEM_REDIS_MODE') return 'external';
+      if (key === 'CLAUDE_MEM_REDIS_URL') return '';
+      if (key === 'CLAUDE_MEM_REDIS_HOST') return '127.0.0.1';
+      if (key === 'CLAUDE_MEM_REDIS_PORT') return '6379';
+      if (key === 'CLAUDE_MEM_QUEUE_REDIS_PREFIX') return 'claude_mem';
+      if (key === 'CLAUDE_MEM_WELCOME_HINT_ENABLED') return 'true';
+      if (key === 'CLAUDE_MEM_WORKER_PORT') return '37777';
       return '';
     },
     getInt: () => 0,
-    loadFromFile: () => ({ CLAUDE_MEM_EXCLUDED_PROJECTS: [] }),
+    loadFromFile: () => ({
+      CLAUDE_MEM_EXCLUDED_PROJECTS: [],
+      CLAUDE_MEM_QUEUE_ENGINE: 'sqlite',
+      CLAUDE_MEM_REDIS_MODE: 'external',
+      CLAUDE_MEM_REDIS_URL: '',
+      CLAUDE_MEM_REDIS_HOST: '127.0.0.1',
+      CLAUDE_MEM_REDIS_PORT: '6379',
+      CLAUDE_MEM_QUEUE_REDIS_PREFIX: 'claude_mem',
+      CLAUDE_MEM_WELCOME_HINT_ENABLED: 'true',
+      CLAUDE_MEM_WORKER_PORT: '37777',
+    }),
   },
 }));
 
