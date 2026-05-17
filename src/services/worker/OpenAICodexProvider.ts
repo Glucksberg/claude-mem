@@ -134,15 +134,15 @@ function missingAuthMessage(): string {
 
 async function getAccessToken(): Promise<string> {
   const authPath = getCodexCliAuthPath();
-  const auth = loadCodexCliAuthStore(authPath);
-  if (!auth) {
-    throw new ClassifiedProviderError(missingAuthMessage(), { kind: 'auth_invalid', cause: new Error('missing OpenAI Codex OAuth profile') });
-  }
-
   const cached = tokenCache.get(authPath);
 
   if (cached && Date.now() < cached.expires - TOKEN_REFRESH_BUFFER_MS) {
     return cached.access;
+  }
+
+  const auth = loadCodexCliAuthStore(authPath);
+  if (!auth) {
+    throw new ClassifiedProviderError(missingAuthMessage(), { kind: 'auth_invalid', cause: new Error('missing OpenAI Codex OAuth profile') });
   }
 
   const profile = auth.credential;

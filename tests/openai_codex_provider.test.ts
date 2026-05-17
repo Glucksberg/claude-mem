@@ -141,6 +141,49 @@ describe('OpenAICodexProvider selection', () => {
     expect(options?.sessionId).toStartWith('claude-mem-');
   });
 
+  it('uses a valid cached Codex CLI OAuth token if auth.json temporarily disappears', async () => {
+    const accessToken = createFutureJwt();
+    const configuredModel = 'gpt-5.4-mini';
+    const authPath = join(tempDir, 'auth.json');
+    writeFileSync(authPath, JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: {
+        access_token: accessToken,
+        refresh_token: 'refresh-token',
+        account_id: 'account-id',
+      },
+      last_refresh: new Date().toISOString(),
+    }));
+
+    loadFromFileSpy = spyOn(SettingsDefaultsManager, 'loadFromFile').mockImplementation(() => ({
+      ...SettingsDefaultsManager.getAllDefaults(),
+      CLAUDE_MEM_PROVIDER: 'openai-codex',
+      CLAUDE_MEM_OPENAI_CODEX_MODEL: configuredModel,
+    }));
+
+    completeSimpleSpy = spyOn(piAi, 'completeSimple').mockResolvedValue({
+      role: 'assistant',
+      content: [],
+      api: 'openai-codex-responses',
+      provider: 'openai-codex',
+      model: configuredModel,
+      usage: emptyUsage(),
+      stopReason: 'stop',
+      timestamp: Date.now(),
+    });
+
+    ModeManager.getInstance().loadMode('code');
+
+    const provider = new OpenAICodexProvider(fakeDbManager(), fakeSessionManager());
+    await provider.startSession(createActiveSession({ sessionDbId: 201, memorySessionId: 'cached-token-1' }));
+
+    rmSync(authPath, { force: true });
+    await provider.startSession(createActiveSession({ sessionDbId: 202, memorySessionId: 'cached-token-2' }));
+
+    expect(completeSimpleSpy).toHaveBeenCalledTimes(2);
+    expect(completeSimpleSpy.mock.calls[1][2]?.apiKey).toBe(accessToken);
+  });
+
   it('hard-stops SessionRoutes on non-retryable OpenAI Codex provider errors without falling back to Claude', async () => {
     for (const kind of ['auth_invalid', 'quota_exhausted', 'unrecoverable'] as ProviderErrorClass[]) {
       loadFromFileSpy?.mockRestore();
