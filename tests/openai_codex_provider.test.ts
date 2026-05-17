@@ -8,6 +8,7 @@ import {
   getOpenAICodexSessionId,
   isOpenAICodexAvailable,
   isOpenAICodexSelected,
+  classifyOpenAICodexError,
   OpenAICodexProvider
 } from '../src/services/worker/OpenAICodexProvider';
 import { SettingsDefaultsManager } from '../src/shared/SettingsDefaultsManager';
@@ -255,6 +256,16 @@ describe('OpenAICodexProvider selection', () => {
     await expect(provider.startSession(createActiveSession())).rejects.toMatchObject({
       kind: 'auth_invalid',
     });
+  });
+
+  it('does not classify context-length token errors as OAuth failures', () => {
+    const error = classifyOpenAICodexError({
+      status: 400,
+      bodyText: "This model's maximum context length is 128000 tokens.",
+      cause: new Error('context length'),
+    });
+
+    expect(error.kind).toBe('unrecoverable');
   });
 });
 

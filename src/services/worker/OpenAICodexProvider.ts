@@ -28,6 +28,13 @@ const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 type CodexModel = Model<'openai-codex-responses'>;
 type HeadersLike = Headers | { get(name: string): string | null };
 
+interface CodexCompletionResult {
+  content: string;
+  tokensUsed?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
 interface CodexCliAuthStore {
   tokens?: {
     access_token?: string;
@@ -260,7 +267,15 @@ export function classifyOpenAICodexError(input: {
     );
   }
 
-  if (status === 401 || status === 403 || lower.includes('oauth') || lower.includes('token')) {
+  if (
+    status === 401
+    || status === 403
+    || lower.includes('oauth')
+    || lower.includes('access token')
+    || lower.includes('refresh token')
+    || lower.includes('authorization token')
+    || lower.includes('bearer token')
+  ) {
     return new ClassifiedProviderError(
       `OpenAI Codex auth error${status !== undefined ? ` (status ${status})` : ''}`,
       { kind: 'auth_invalid', cause: input.cause },
@@ -435,7 +450,7 @@ export class OpenAICodexProvider {
   }
 
   private async handleInitResponse(
-    response: { content: string; tokensUsed?: number },
+    response: CodexCompletionResult,
     session: ActiveSession,
     worker: WorkerRef | undefined,
     modelId: string,
@@ -466,15 +481,19 @@ export class OpenAICodexProvider {
   }
 
   private recordAssistantResponse(
-    response: { content: string; tokensUsed?: number },
+    response: CodexCompletionResult,
     session: ActiveSession,
   ): number {
     if (!response.content) return 0;
 
     session.conversationHistory.push({ role: 'assistant', content: response.content });
     const tokensUsed = response.tokensUsed || 0;
-    session.cumulativeInputTokens += Math.floor(tokensUsed * 0.7);
-    session.cumulativeOutputTokens += Math.floor(tokensUsed * 0.3);
+    if (response.inputTokens !== undefined) {
+      session.cumulativeInputTokens += response.inputTokens;
+    }
+    if (response.outputTokens !== undefined) {
+      session.cumulativeOutputTokens += response.outputTokens;
+    }
     return tokensUsed;
   }
 
@@ -571,7 +590,7 @@ export class OpenAICodexProvider {
   private async queryCodex(
     session: ActiveSession,
     modelId: string,
-  ): Promise<{ content: string; tokensUsed?: number }> {
+  ): Promise<CodexCompletionResult> {
     const model = this.getModel(modelId);
     const apiKey = await getAccessToken();
     const context = this.conversationToContext(session, modelId);
@@ -601,21 +620,27 @@ export class OpenAICodexProvider {
     }
 
     const content = this.extractTextContent(message);
-    const tokensUsed = message.usage?.totalTokens;
+    const usage = message.usage;
+    const tokensUsed = usage?.totalTokens;
 
     if (tokensUsed) {
       logger.info('SDK', 'OpenAI Codex usage', {
         model: modelId,
-        inputTokens: message.usage.input,
-        outputTokens: message.usage.output,
-        cacheRead: message.usage.cacheRead,
-        cacheWrite: message.usage.cacheWrite,
+        inputTokens: usage.input,
+        outputTokens: usage.output,
+        cacheRead: usage.cacheRead,
+        cacheWrite: usage.cacheWrite,
         totalTokens: tokensUsed,
         messagesInContext: context.messages.length,
       });
     }
 
-    return { content, tokensUsed };
+    return {
+      content,
+      tokensUsed,
+      inputTokens: usage?.input,
+      outputTokens: usage?.output,
+    };
   }
 
   private extractTextContent(message: AssistantMessage): string {
