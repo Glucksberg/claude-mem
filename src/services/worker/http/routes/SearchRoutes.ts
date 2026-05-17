@@ -40,14 +40,21 @@ const cachedOnboardingExplainer: string | null = (() => {
 const SETTINGS_CACHE_TTL_MS = 5000;
 let cachedSettings: ReturnType<typeof SettingsDefaultsManager.loadFromFile> | null = null;
 let cachedSettingsAt = 0;
+let cachedWelcomeHintEnv: string | undefined;
 
 function getCachedSettings(): ReturnType<typeof SettingsDefaultsManager.loadFromFile> {
   const now = Date.now();
-  if (cachedSettings && now - cachedSettingsAt < SETTINGS_CACHE_TTL_MS) {
+  const welcomeHintEnv = process.env.CLAUDE_MEM_WELCOME_HINT_ENABLED;
+  if (
+    cachedSettings &&
+    cachedWelcomeHintEnv === welcomeHintEnv &&
+    now - cachedSettingsAt < SETTINGS_CACHE_TTL_MS
+  ) {
     return cachedSettings;
   }
   cachedSettings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
   cachedSettingsAt = now;
+  cachedWelcomeHintEnv = welcomeHintEnv;
   return cachedSettings;
 }
 
@@ -352,7 +359,8 @@ export class SearchRoutes extends BaseRouteHandler {
     }
 
     const settings = getCachedSettings();
-    const hintEnabled = String(settings.CLAUDE_MEM_WELCOME_HINT_ENABLED ?? '').toLowerCase() === 'true';
+    const hintSetting = process.env.CLAUDE_MEM_WELCOME_HINT_ENABLED ?? settings.CLAUDE_MEM_WELCOME_HINT_ENABLED;
+    const hintEnabled = String(hintSetting ?? '').toLowerCase() === 'true';
     if (hintEnabled && !full) {
       const sessionStore = this.searchManager.getSessionStore();
       // Memoized: skips the COUNT(*) query once any project in the set has

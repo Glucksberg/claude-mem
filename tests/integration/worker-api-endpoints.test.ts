@@ -3,7 +3,19 @@ import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:te
 import { logger } from '../../src/utils/logger.js';
 
 mock.module('../../src/services/worker/http/middleware.js', () => ({
-  createMiddleware: () => [],
+  createMiddleware: () => [((req: any, res: any, next: any) => {
+    const origin = req.headers.origin;
+    if (origin?.startsWith('http://localhost:') || origin?.startsWith('http://127.0.0.1:')) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With');
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(204);
+      return;
+    }
+    next();
+  })],
   requireLocalhost: (_req: any, _res: any, next: any) => next(),
   summarizeRequestBody: () => 'test body',
 }));
