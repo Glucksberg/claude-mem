@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll, mock } from 'bun:test';
+import fs from 'node:fs';
+import path from 'node:path';
 
 // Singleton enforcement regression coverage for issue #2313.
 //
@@ -8,6 +10,13 @@ import { describe, it, expect, beforeEach, mock } from 'bun:test';
 // only signals the direct child (uvx). The fix routes every "abandon current
 // transport" path through disposeCurrentSubprocess(), which tree-kills via
 // killProcessTree() before nulling the handles.
+
+const ORIGINAL_CLAUDE_MEM_DATA_DIR = process.env.CLAUDE_MEM_DATA_DIR;
+const FAKE_DATA_DIR = `/tmp/fake-claude-mem-${process.pid}`;
+const FAKE_CHROMA_DIR = path.join(FAKE_DATA_DIR, 'chroma');
+const FAKE_CHROMA_LOCK = path.join(FAKE_CHROMA_DIR, '.claude-mem-chroma-mcp.lock');
+
+process.env.CLAUDE_MEM_DATA_DIR = FAKE_DATA_DIR;
 
 let transportCount = 0;
 const transportInstances: Array<FakeTransport> = [];
@@ -99,7 +108,7 @@ mock.module('../../../src/shared/SettingsDefaultsManager.js', () => ({
 mock.module('../../../src/shared/paths.js', () => ({
   USER_SETTINGS_PATH: '/tmp/fake-settings.json',
   paths: {
-    chroma: () => '/tmp/fake-chroma',
+    chroma: () => FAKE_CHROMA_DIR,
     combinedCerts: () => '/tmp/fake-combined-certs.pem',
   },
 }));
@@ -153,21 +162,33 @@ mock.module('child_process', () => {
       }
     },
     execSync: () => '',
+    execFileSync: () => '',
   };
 });
 
-// Stub process.kill so the tree-kill path can record targets without crashing
-// the test runner if the synthetic PID happens to collide with a real one.
-const realProcessKill = process.kill.bind(process);
+// Stub process.kill only while this suite is actively running so the tree-kill
+// path can record targets without crashing the test runner if the synthetic PID
+// happens to collide with a real one. Restoring in afterEach prevents this
+// module-level test double from contaminating later tests in the same Bun worker.
+const realProcessKill = process.kill;
 const stubbedProcessKill = ((pid: number, _signal?: string | number) => {
   killTreeCalls.push(pid);
   return true;
 }) as typeof process.kill;
-process.kill = stubbedProcessKill;
 
-import { ChromaMcpManager } from '../../../src/services/sync/ChromaMcpManager.js';
+function installProcessKillStub(): void {
+  process.kill = stubbedProcessKill;
+}
+
+function restoreProcessKill(): void {
+  process.kill = realProcessKill;
+}
+
+const { ChromaMcpManager } = await import('../../../src/services/sync/ChromaMcpManager.js');
 
 function resetState(): void {
+  try { fs.unlinkSync(FAKE_CHROMA_LOCK); } catch { /* absent */ }
+  try { fs.mkdirSync(FAKE_CHROMA_DIR, { recursive: true }); } catch { /* best-effort */ }
   transportCount = 0;
   transportInstances.length = 0;
   killTreeCalls.length = 0;
@@ -177,8 +198,28 @@ function resetState(): void {
 
 describe('ChromaMcpManager singleton enforcement (#2313)', () => {
   beforeEach(async () => {
+    installProcessKillStub();
     await ChromaMcpManager.reset();
     resetState();
+  });
+
+  afterEach(async () => {
+    try {
+      await ChromaMcpManager.reset();
+      try { fs.unlinkSync(FAKE_CHROMA_LOCK); } catch { /* absent */ }
+    } finally {
+      restoreProcessKill();
+    }
+  });
+
+  afterAll(() => {
+    restoreProcessKill();
+    try { fs.rmSync(FAKE_DATA_DIR, { recursive: true, force: true }); } catch { /* best-effort */ }
+    if (ORIGINAL_CLAUDE_MEM_DATA_DIR === undefined) {
+      delete process.env.CLAUDE_MEM_DATA_DIR;
+    } else {
+      process.env.CLAUDE_MEM_DATA_DIR = ORIGINAL_CLAUDE_MEM_DATA_DIR;
+    }
   });
 
   it('serializes concurrent ensureConnected() calls into one spawn', async () => {
@@ -241,10 +282,4 @@ describe('ChromaMcpManager singleton enforcement (#2313)', () => {
     await mgr.callTool('chroma_list_collections', { limit: 1 });
     expect(transportInstances.length).toBe(2);
   });
-});
-
-// Restore the real process.kill once the test module finishes evaluating any
-// late-arriving microtasks.
-process.on('exit', () => {
-  process.kill = realProcessKill;
 });
