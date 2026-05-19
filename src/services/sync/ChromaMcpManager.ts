@@ -73,8 +73,6 @@ export class ChromaMcpManager {
   }
 
   private async ensureConnected(): Promise<void> {
-    this.startParentDeathMonitor();
-
     if (this.cleanupInProgress) {
       await this.cleanupInProgress;
     }
@@ -418,7 +416,6 @@ export class ChromaMcpManager {
         void cleanupAsync('stdin-close');
       };
       stdin.once('close', handleStdinClosed);
-      stdin.once('end', handleStdinClosed);
     }
   }
 
@@ -659,6 +656,8 @@ export class ChromaMcpManager {
    * pattern from shutdown.ts (Principle 5: OS-supervised teardown).
    */
   async stop(): Promise<void> {
+    this.lastConnectionFailureTimestamp = 0;
+
     if (!this.client && !this.transport && !this.trackedSubprocessPid && !this.chromaLockPath) {
       logger.debug('CHROMA_MCP', 'No active MCP connection to stop');
       this.stopParentDeathMonitor();
