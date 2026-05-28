@@ -121,13 +121,13 @@ export class ChromaMcpManager {
     const persistentDataDir = this.getPersistentDataDir(commandArgs);
     const spawnEnvironment = this.getSpawnEnv();
     getSupervisor().assertCanSpawn('chroma mcp');
-    this.acquirePersistentDataDirLock(persistentDataDir);
 
     const isWindows = process.platform === 'win32';
     const uvxSpawnCommand = isWindows ? (process.env.ComSpec || 'cmd.exe') : 'uvx';
     const uvxSpawnArgs = isWindows ? ['/c', 'uvx', ...commandArgs] : commandArgs;
 
     try {
+      this.acquirePersistentDataDirLock(persistentDataDir);
       logger.info('CHROMA_MCP', 'Connecting to chroma-mcp via MCP stdio', {
         command: uvxSpawnCommand,
         args: uvxSpawnArgs.join(' ')
@@ -276,7 +276,17 @@ export class ChromaMcpManager {
         const fd = fs.openSync(lockPath, 'wx');
         this.chromaLockFd = fd;
         this.chromaLockPath = lockPath;
-        this.writePersistentDataDirLock(null);
+        try {
+          this.writePersistentDataDirLock(null);
+        } catch (writeError) {
+          // writePersistentDataDirLock failed after openSync already succeeded
+          // (e.g. ENOSPC during fsyncSync). Close and reset the fd/path so this
+          // instance does not hold a leaked descriptor or inconsistent state.
+          this.chromaLockFd = null;
+          this.chromaLockPath = null;
+          try { fs.closeSync(fd); } catch { /* best-effort */ }
+          throw writeError;
+        }
         return;
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
