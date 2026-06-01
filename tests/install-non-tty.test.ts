@@ -143,6 +143,13 @@ describe('Install Non-TTY Support', () => {
       expect(gitignoreExcludeRegion).toContain('syncManagedFiles.has(line)');
     });
 
+    it('syncs the local Codex plugin cache during marketplace sync', () => {
+      expect(syncMarketplaceSource).toContain("'.codex', 'plugins', 'cache', 'claude-mem-local', 'claude-mem'");
+      expect(syncMarketplaceSource).toContain('Codex cache folder');
+      expect(syncMarketplaceSource).toContain('--exclude=node_modules');
+      expect(syncMarketplaceSource).toContain('writeInstallMarker(destinationPath, getPluginVersion())');
+    });
+
     it('registers Codex against the durable marketplace directory', () => {
       expect(installSource).toContain('installCodexCli(marketplaceDirectory())');
     });
@@ -154,6 +161,7 @@ describe('Install Non-TTY Support', () => {
       );
       expect(installRegion).toContain("['plugin', 'marketplace', 'upgrade', MARKETPLACE_NAME]");
       expect(installRegion).toContain('installed plugin cache');
+      expect(installRegion).toContain('syncCodexLocalCache(marketplaceRoot)');
     });
 
     it('replaces stale Codex marketplace registrations from a different source', () => {

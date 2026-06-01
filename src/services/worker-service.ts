@@ -967,6 +967,9 @@ async function main() {
   switch (command) {
     case 'start': {
       const result = await ensureWorkerStarted(port);
+      if (process.env.CLAUDE_MEM_CODEX_HOOK === '1') {
+        process.exit(0);
+      }
       if (result === 'dead') {
         exitWithStatus('error', 'Failed to start worker');
       } else {
