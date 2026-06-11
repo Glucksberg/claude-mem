@@ -1,7 +1,7 @@
 import path from 'path';
 import { homedir } from 'os';
 import { execFileSync, spawnSync, type SpawnSyncReturns } from 'child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { logger } from '../../utils/logger.js';
 import { paths } from '../../shared/paths.js';
@@ -14,6 +14,7 @@ const MARKETPLACE_NAME = 'claude-mem-local';
 const CODEX_PLUGIN_ID = `claude-mem@${MARKETPLACE_NAME}`;
 const LEGACY_CODEX_PLUGIN_IDS = ['claude-mem@thedotmack'];
 const MIN_CODEX_MARKETPLACE_VERSION = '0.128.0';
+const CODEX_PLUGIN_CACHE_BASE = path.join(CODEX_DIR, 'plugins', 'cache', MARKETPLACE_NAME, 'claude-mem');
 const REQUIRED_MARKETPLACE_FILES = [
   path.join('.agents', 'plugins', 'marketplace.json'),
   path.join('plugin', '.codex-plugin', 'plugin.json'),
@@ -157,6 +158,37 @@ function registerCodexMarketplace(marketplaceRoot: string): void {
   console.warn(`  Codex marketplace ${MARKETPLACE_NAME} is already registered from another source; replacing it with ${marketplaceRoot}.`);
   runCodex(['plugin', 'marketplace', 'remove', MARKETPLACE_NAME]);
   runCodex(['plugin', 'marketplace', 'add', marketplaceRoot]);
+}
+
+function writeCodexInstallMarker(pluginRoot: string, version: string): void {
+  writeFileSync(
+    path.join(pluginRoot, '.install-version'),
+    JSON.stringify({ version, installedAt: new Date().toISOString() }, null, 2) + '\n',
+  );
+}
+
+function syncCodexLocalCache(marketplaceRoot: string): void {
+  const bundledPluginRoot = path.join(marketplaceRoot, 'plugin');
+  const packageJsonPath = path.join(bundledPluginRoot, 'package.json');
+  const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8')) as { version?: string };
+  const version = packageJson.version;
+  if (!version) {
+    throw new Error(`Bundled Codex plugin package.json at ${packageJsonPath} is missing version`);
+  }
+
+  const cacheRoot = path.join(CODEX_PLUGIN_CACHE_BASE, version);
+  mkdirSync(path.dirname(cacheRoot), { recursive: true });
+  rmSync(cacheRoot, { recursive: true, force: true });
+  cpSync(bundledPluginRoot, cacheRoot, { recursive: true, force: true });
+
+  if (!commandExists('bun')) {
+    console.warn(`  Codex plugin cache copied to ${cacheRoot}, but bun was not found; runtime dependencies were not installed.`);
+    return;
+  }
+
+  execFileSync('bun', ['install'], { cwd: cacheRoot, stdio: 'ignore' });
+  writeCodexInstallMarker(cacheRoot, version);
+  console.log(`  Installed Codex local plugin cache: ${cacheRoot}`);
 }
 
 export function setTomlBooleanInTable(content: string, header: string, key: string, enabled: boolean): string {
@@ -383,6 +415,7 @@ export async function installCodexCli(marketplaceRootOverride?: string): Promise
       'Refreshed Codex marketplace and installed plugin cache.',
       'Could not refresh Codex marketplace cache; reinstall or upgrade claude-mem from /plugins if Codex still uses old MCP config',
     );
+    syncCodexLocalCache(marketplaceRoot);
     if (!cleanupLegacyCodexAgentsMdContext()) {
       console.warn(`  Native Codex hooks registered, but failed to remove legacy AGENTS.md context from ${CODEX_AGENTS_MD_PATH}.`);
     }

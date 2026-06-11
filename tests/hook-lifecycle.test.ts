@@ -218,7 +218,7 @@ describe('Codex CLI Compatibility (#744)', () => {
       expect(output).not.toHaveProperty('suppressOutput');
     });
 
-    it('does not emit hookSpecificOutput for Stop outputs', async () => {
+    it('does not emit unsupported suppressOutput or hookSpecificOutput for Stop outputs', async () => {
       const { codexAdapter } = await import('../src/cli/adapters/codex.js');
       const output = codexAdapter.formatOutput({
         continue: true,

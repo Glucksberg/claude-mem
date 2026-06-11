@@ -241,9 +241,9 @@ const claudeHook = (tail: string[], extra: Record<string, unknown> = {}) => buil
   host: 'claude-code', requireFile: 'bun-runner.js', requireFileSecondary: 'worker-service.cjs',
   trailingCommand: ccTrailing(...tail), notFoundMessage: 'claude-mem: plugin scripts not found', ...extra,
 });
-const codexHook = (tail: string[]) => buildShellCommand({
+const codexHook = (tail: string[], extra: Record<string, unknown> = {}) => buildShellCommand({
   host: 'codex-cli', requireFile: 'bun-runner.js', requireFileSecondary: 'worker-service.cjs',
-  trailingCommand: ccTrailing(...tail), notFoundMessage: 'claude-mem: plugin scripts not found',
+  trailingCommand: ccTrailing(...tail), notFoundMessage: 'claude-mem: plugin scripts not found', ...extra,
 });
 
 const RULE_A_EXPECTATIONS: Record<string, Record<string, string>> = {
@@ -266,7 +266,7 @@ const RULE_A_EXPECTATIONS: Record<string, Record<string, string>> = {
       trailingCommand: ['node', '"$_P/scripts/version-check.js"'],
       notFoundMessage: 'claude-mem: version-check.js not found',
     }),
-    'SessionStart.0.1': codexHook(['start']),
+    'SessionStart.0.1': codexHook(['start'], { extraEnv: { CLAUDE_MEM_CODEX_HOOK: '1' } }),
     'SessionStart.0.2': codexHook(['hook', 'codex', 'context']),
     'UserPromptSubmit.0.0': codexHook(['hook', 'codex', 'session-init']),
     'PreToolUse.0.0': codexHook(['hook', 'codex', 'file-context']),
