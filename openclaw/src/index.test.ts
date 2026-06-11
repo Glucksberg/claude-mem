@@ -110,6 +110,7 @@ describe("claudeMemPlugin", () => {
     assert.ok(getEventHandlers("before_agent_start").length > 0, "before_agent_start handler registered");
     assert.ok(getEventHandlers("before_prompt_build").length > 0, "before_prompt_build handler registered");
     assert.ok(getEventHandlers("tool_result_persist").length > 0, "tool_result_persist handler registered");
+    assert.ok(getEventHandlers("after_tool_call").length > 0, "after_tool_call handler registered");
     assert.ok(getEventHandlers("agent_end").length > 0, "agent_end handler registered");
     assert.ok(getEventHandlers("gateway_start").length > 0, "gateway_start handler registered");
     assert.ok(logs.some((l) => l.includes("plugin loaded")));
@@ -302,7 +303,7 @@ describe("Observation I/O event handlers", () => {
     workerServer?.close();
   });
 
-  it("session_start sends session init to worker", async () => {
+  it("session_start initializes local session tracking only", async () => {
     const { api, logs, fireEvent } = createMockApi({ workerPort });
     claudeMemPlugin(api);
 
@@ -312,33 +313,34 @@ describe("Observation I/O event handlers", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    const initRequest = receivedRequests.find((r) => r.url === "/api/sessions/init");
-    assert.ok(initRequest, "should send init request to worker");
-    assert.equal(initRequest!.body.project, "openclaw");
-    assert.ok(initRequest!.body.contentSessionId.startsWith("openclaw-agent-1-"));
-    assert.ok(logs.some((l) => l.includes("Session initialized")));
+    const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
+    assert.equal(initRequests.length, 0, "session_start should not write a prompt");
+    assert.ok(logs.some((l) => l.includes("Session tracking initialized")));
   });
 
-  it("session_start calls init on worker", async () => {
+  it("session_start preserves the content session id for before_agent_start", async () => {
     const { api, fireEvent } = createMockApi({ workerPort });
     claudeMemPlugin(api);
 
-    await fireEvent("session_start", { sessionId: "test-session-1" }, {});
+    await fireEvent("session_start", { sessionId: "test-session-1" }, { sessionKey: "same-session" });
+    await fireEvent("before_agent_start", { prompt: "hello" }, { sessionKey: "same-session" });
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
-    assert.equal(initRequests.length, 1, "should init on session_start");
+    assert.equal(initRequests.length, 1, "before_agent_start should init the tracked session");
+    assert.ok(initRequests[0].body.contentSessionId.startsWith("openclaw-same-session-"));
   });
 
-  it("after_compaction re-inits session on worker", async () => {
-    const { api, fireEvent } = createMockApi({ workerPort });
+  it("after_compaction preserves local session tracking only", async () => {
+    const { api, logs, fireEvent } = createMockApi({ workerPort });
     claudeMemPlugin(api);
 
     await fireEvent("after_compaction", { messageCount: 5, compactedCount: 3 }, {});
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
-    assert.equal(initRequests.length, 1, "should re-init after compaction");
+    assert.equal(initRequests.length, 0, "after_compaction should not write a prompt");
+    assert.ok(logs.some((l) => l.includes("Session preserved after compaction")));
   });
 
   it("before_agent_start calls init for session privacy check", async () => {
@@ -350,6 +352,149 @@ describe("Observation I/O event handlers", () => {
 
     const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
     assert.equal(initRequests.length, 1, "before_agent_start should init session");
+    assert.equal(initRequests[0].body.platformSource, "openclaw");
+  });
+
+  it("uses configured platformSource for worker writes", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort, platformSource: "openai-codex" });
+    claudeMemPlugin(api);
+
+    await fireEvent("before_agent_start", { prompt: "hello" }, { sessionKey: "codex-configured" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    await fireEvent("tool_result_persist", {
+      toolName: "Read",
+      params: { file_path: "/src/index.ts" },
+      message: { content: [{ type: "text", text: "contents" }] },
+    }, { sessionKey: "codex-configured" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    await fireEvent("agent_end", {
+      messages: [{ role: "assistant", content: "done" }],
+    }, { sessionKey: "codex-configured" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const initRequest = receivedRequests.find((r) => r.url === "/api/sessions/init");
+    const obsRequest = receivedRequests.find((r) => r.url === "/api/sessions/observations");
+    const summarizeRequest = receivedRequests.find((r) => r.url === "/api/sessions/summarize");
+    assert.equal(initRequest?.body.platformSource, "codex");
+    assert.equal(obsRequest?.body.platformSource, "codex");
+    assert.equal(summarizeRequest?.body.platformSource, "codex");
+  });
+
+  it("before_agent_start skips OpenClaw internal commitment extraction prompts", async () => {
+    const { api, logs, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent("before_agent_start", {
+      prompt: [
+        "You are OpenClaw's internal commitment extractor.",
+        "This is a hidden background classification run. Do not address the user.",
+        'Output JSON only, with top-level {"candidates":[...]}.',
+      ].join("\n\n"),
+    }, { sessionKey: "commitments:test" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
+    assert.equal(initRequests.length, 0, "internal OpenClaw prompt should not init a memory session");
+    assert.ok(logs.some((l) => l.includes("Skipping internal OpenClaw prompt init")));
+  });
+
+  it("before_agent_start skips OpenClaw operational prompts", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    const prompts = [
+      [
+        "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly.",
+        "If the heartbeat_respond tool is available, call it to record the heartbeat outcome.",
+      ].join("\n"),
+      "An async command completion event was triggered, but user delivery is disabled for this run. reply HEARTBEAT_OK only.",
+      "[Inter-session message] sourceSession=x sourceTool=subagent_announce isUser=false This content was routed by OpenClaw",
+      "[Sun 2026-05-17 03:34 UTC] [Subagent Context] You are running as a subagent (depth 1/2).",
+    ];
+
+    for (const prompt of prompts) {
+      await fireEvent("before_agent_start", { prompt }, { sessionKey: `internal-${prompts.indexOf(prompt)}` });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
+    assert.equal(initRequests.length, 0, "OpenClaw operational prompts should not init memory sessions");
+  });
+
+  it("before_agent_start skips duplicate prompt init for the same session", async () => {
+    const { api, logs, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent("before_agent_start", { prompt: "same prompt" }, { sessionKey: "dup-session" });
+    await fireEvent("before_agent_start", { prompt: "same prompt" }, { sessionKey: "dup-session" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
+    assert.equal(initRequests.length, 1, "duplicate prompt init should be ignored");
+    assert.ok(logs.some((l) => l.includes("Skipping duplicate prompt init")));
+  });
+
+  it("before_agent_start captures repeated prompts after the duplicate window", async () => {
+    const originalDateNow = Date.now;
+    let now = 1_000_000;
+    Date.now = () => now;
+
+    try {
+      const { api, fireEvent } = createMockApi({ workerPort });
+      claudeMemPlugin(api);
+
+      await fireEvent("before_agent_start", { prompt: "repeatable prompt" }, { sessionKey: "repeat-session" });
+      now += 31_000;
+      await fireEvent("before_agent_start", { prompt: "repeatable prompt" }, { sessionKey: "repeat-session" });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
+      assert.equal(initRequests.length, 2, "same prompt should be captured again after the duplicate window");
+    } finally {
+      Date.now = originalDateNow;
+    }
+  });
+
+  it("session_end clears session tracking without throwing", async () => {
+    const { api, logs, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent("before_agent_start", { prompt: "hello" }, { sessionKey: "cleanup-session" });
+    await fireEvent("session_end", { sessionId: "cleanup-session", messageCount: 1 }, { sessionKey: "cleanup-session" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.ok(logs.some((l) => l.includes("Session tracking cleaned up")));
+  });
+
+  it("before_agent_start strips OpenClaw untrusted metadata from stored prompts", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent("before_agent_start", {
+      prompt: [
+        "Conversation info (untrusted metadata):",
+        "```json",
+        "{\"chat_id\":\"telegram:123\"}",
+        "```",
+        "",
+        "Sender (untrusted metadata):",
+        "```json",
+        "{\"name\":\"Test User\"}",
+        "```",
+        "",
+        "consegue fazer uma pesquisa no X pra mim?",
+      ].join("\n"),
+    }, { sessionKey: "telegram:test", agentId: "researcher" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
+    assert.equal(initRequests.length, 1);
+    assert.equal(initRequests[0].body.project, "openclaw-researcher");
+    assert.equal(initRequests[0].body.prompt, "consegue fazer uma pesquisa no X pra mim?");
+    assert.ok(!initRequests[0].body.prompt.includes("Conversation info"));
+    assert.ok(!initRequests[0].body.prompt.includes("Sender"));
   });
 
   it("tool_result_persist sends observation to worker", async () => {
@@ -375,6 +520,81 @@ describe("Observation I/O event handlers", () => {
     assert.deepEqual(obsRequest!.body.tool_input, { file_path: "/src/index.ts" });
     assert.equal(obsRequest!.body.tool_response, "file contents here...");
     assert.ok(obsRequest!.body.contentSessionId.startsWith("openclaw-test-agent-"));
+    assert.equal(obsRequest!.body.platformSource, "openclaw");
+    assert.equal(obsRequest!.body.cwd, "/openclaw/openclaw");
+  });
+
+  it("after_tool_call sends observation when no tool_result_persist arrives", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent("after_tool_call", {
+      toolName: "shell",
+      params: { command: "pwd" },
+      result: { stdout: "/workspace\n" },
+      toolCallId: "tool-1",
+    }, { sessionKey: "fallback-session", agentId: "worker", workspaceDir: "/workspace" });
+
+    await new Promise((resolve) => setTimeout(resolve, 700));
+
+    const obsRequest = receivedRequests.find((r) => r.url === "/api/sessions/observations");
+    assert.ok(obsRequest, "should send observation from after_tool_call fallback");
+    assert.equal(obsRequest!.body.tool_name, "shell");
+    assert.deepEqual(obsRequest!.body.tool_input, { command: "pwd" });
+    assert.equal(obsRequest!.body.tool_response, "{\"stdout\":\"/workspace\\n\"}");
+    assert.equal(obsRequest!.body.cwd, "/workspace");
+    assert.equal(obsRequest!.body.platformSource, "openclaw");
+  });
+
+  it("after_tool_call fallback is canceled when tool_result_persist handles the same tool", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    const ctx = { sessionKey: "dedupe-session", agentId: "worker", workspaceDir: "/workspace" };
+    const params = { command: "pwd" };
+
+    await fireEvent("after_tool_call", {
+      toolName: "shell",
+      params,
+      result: { stdout: "fallback output" },
+      toolCallId: "tool-2",
+    }, ctx);
+
+    await fireEvent("tool_result_persist", {
+      toolName: "shell",
+      params,
+      toolCallId: "tool-2",
+      message: {
+        content: [{ type: "text", text: "persist output" }],
+      },
+    }, ctx);
+
+    await new Promise((resolve) => setTimeout(resolve, 700));
+
+    const obsRequests = receivedRequests.filter((r) => r.url === "/api/sessions/observations");
+    assert.equal(obsRequests.length, 1, "same tool call should be observed only once");
+    assert.equal(obsRequests[0].body.tool_response, "persist output");
+  });
+
+  it("tool_result_persist uses agent project fallback cwd when workspaceDir is unavailable", async () => {
+    const { api, logs, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent("tool_result_persist", {
+      toolName: "exec",
+      params: { command: "pwd" },
+      message: {
+        content: [{ type: "text", text: "output" }],
+      },
+    }, { sessionKey: "agent-main", agentId: "main" });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const obsRequest = receivedRequests.find((r) => r.url === "/api/sessions/observations");
+    assert.ok(obsRequest, "should send observation even without workspaceDir");
+    assert.equal(obsRequest!.body.cwd, "/openclaw/openclaw-main");
+    assert.equal(obsRequest!.body.platformSource, "openclaw");
+    assert.ok(logs.some((l) => l.includes("Using project fallback cwd for observation")));
   });
 
   it("tool_result_persist skips memory_ tools", async () => {
@@ -432,6 +652,7 @@ describe("Observation I/O event handlers", () => {
     assert.ok(summarizeRequest, "should send summarize to worker");
     assert.equal(summarizeRequest!.body.last_assistant_message, "Here is the solution...");
     assert.ok(summarizeRequest!.body.contentSessionId.startsWith("openclaw-summarize-test-"));
+    assert.equal(summarizeRequest!.body.platformSource, "openclaw");
 
     const completeRequest = receivedRequests.find((r) => r.url === "/api/sessions/complete");
     assert.ok(!completeRequest, "should not send complete (worker self-completes)");
@@ -802,7 +1023,7 @@ describe("SSE stream integration", () => {
     server?.close();
   });
 
-  it("connects to SSE stream and receives new_observation events", async () => {
+  it("connects to SSE stream and sends compact new_observation feed messages", async () => {
     const { api, logs, sentMessages, getService } = createMockApi({
       workerPort: serverPort,
       observationFeed: { enabled: true, channel: "telegram", to: "12345" },
@@ -896,6 +1117,307 @@ describe("SSE stream integration", () => {
     assert.ok(sentMessages[0].text.length <= 2200);
 
     await getService().stop({});
+  });
+
+  it("connects to SSE stream and sends new_summary feed messages", async () => {
+    const { api, sentMessages, getService } = createMockApi({
+      workerPort: serverPort,
+      observationFeed: { enabled: true, channel: "telegram", to: "12345" },
+    });
+    claudeMemPlugin(api);
+
+    await getService().start({});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    for (const res of serverResponses) {
+      res.write(
+        `data: ${JSON.stringify({
+          type: "new_summary",
+          summary: {
+            id: 21,
+            session_id: "openai-codex-openclaw-agent:researcher:session-1",
+            platform_source: "openclaw",
+            request: "Researcher session checkpoint",
+            investigated: "Looked through prior events",
+            learned: "OpenClaw agents can emit summary-only memory",
+            completed: "Stored a summary",
+            next_steps: "Watch the next agent event",
+            notes: null,
+            project: "openclaw-researcher",
+            prompt_number: 1,
+            created_at_epoch: Date.now(),
+          },
+          timestamp: Date.now(),
+        })}\n\n`
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes("🦞 OpenClaw (researcher)"));
+    assert.ok(sentMessages[0].text.includes("Researcher session checkpoint"));
+    assert.ok(sentMessages[0].text.includes("Completed"));
+    assert.ok(sentMessages[0].text.includes("Stored a summary"));
+    assert.ok(!sentMessages[0].text.includes("Codex Session"));
+
+    await getService().stop({});
+  });
+
+  it("labels Codex observations by platform_source instead of Claude Code fallback", async () => {
+    const { api, sentMessages, getService } = createMockApi({
+      workerPort: serverPort,
+      observationFeed: { enabled: true, channel: "telegram", to: "12345" },
+    });
+    claudeMemPlugin(api);
+
+    await getService().start({});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    for (const res of serverResponses) {
+      res.write(
+        `data: ${JSON.stringify({
+          type: "new_observation",
+          observation: {
+            id: 12,
+            title: "Codex memory",
+            subtitle: null,
+            project: "app",
+            platform_source: "codex",
+          },
+          timestamp: Date.now(),
+        })}\n\n`
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes("Codex Session (app)"));
+    assert.ok(!sentMessages[0].text.includes("Claude Code Session (app)"));
+
+    await getService().stop({});
+  });
+
+  it("infers Codex feed label from memory_session_id when platform_source is missing", async () => {
+    const { api, sentMessages, getService } = createMockApi({
+      workerPort: serverPort,
+      observationFeed: { enabled: true, channel: "telegram", to: "12345" },
+    });
+    claudeMemPlugin(api);
+
+    await getService().start({});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    for (const res of serverResponses) {
+      res.write(
+        `data: ${JSON.stringify({
+          type: "new_observation",
+          observation: {
+            id: 15,
+            memory_session_id: "openai-codex-openclaw-agent:extractor:main-123",
+            title: "Codex inferred memory",
+            subtitle: null,
+            project: "app",
+          },
+          timestamp: Date.now(),
+        })}\n\n`
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes("Codex Session (app)"));
+    assert.ok(!sentMessages[0].text.includes("Claude Code Session (app)"));
+
+    await getService().stop({});
+  });
+
+  it("labels Codex projects that start with openclaw by platform_source", async () => {
+    const { api, sentMessages, getService } = createMockApi({
+      workerPort: serverPort,
+      observationFeed: { enabled: true, channel: "telegram", to: "12345" },
+    });
+    claudeMemPlugin(api);
+
+    await getService().start({});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    for (const res of serverResponses) {
+      res.write(
+        `data: ${JSON.stringify({
+          type: "new_observation",
+          observation: {
+            id: 14,
+            title: "Codex prefixed repo",
+            subtitle: null,
+            project: "openclaw-fork-manager",
+            platform_source: "codex",
+          },
+          timestamp: Date.now(),
+        })}\n\n`
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes("Codex Session (openclaw-fork-manager)"));
+    assert.ok(sentMessages[0].text.includes("Codex prefixed repo"));
+    assert.ok(!sentMessages[0].text.includes("🦞 OpenClaw (fork-manager)"));
+
+    await getService().stop({});
+  });
+
+  it("labels custom OpenClaw projects by openclaw platform_source", async () => {
+    const { api, sentMessages, getService } = createMockApi({
+      workerPort: serverPort,
+      observationFeed: { enabled: true, channel: "telegram", to: "12345" },
+    });
+    claudeMemPlugin(api);
+
+    await getService().start({});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    for (const res of serverResponses) {
+      res.write(
+        `data: ${JSON.stringify({
+          type: "new_observation",
+          observation: {
+            id: 13,
+            title: "OpenClaw memory",
+            subtitle: null,
+            project: "app",
+            platform_source: "openclaw",
+          },
+          timestamp: Date.now(),
+        })}\n\n`
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    assert.equal(sentMessages.length, 1);
+    assert.ok(sentMessages[0].text.includes("app"));
+    assert.ok(!sentMessages[0].text.includes("Claude Code Session (app)"));
+
+    await getService().stop({});
+  });
+
+  it("sends direct Telegram feed messages as plain text", async () => {
+    const originalFetch = globalThis.fetch;
+    const telegramBodies: any[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("https://api.telegram.org/")) {
+        telegramBodies.push(JSON.parse(String(init?.body || "{}")));
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    try {
+      const { api, getService } = createMockApi({
+        workerPort: serverPort,
+        observationFeed: {
+          enabled: true,
+          channel: "telegram",
+          to: "12345",
+          botToken: "test-token",
+        },
+      });
+      delete (api as any).runtime.channel.telegram;
+      claudeMemPlugin(api);
+
+      await getService().start({});
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      for (const res of serverResponses) {
+        res.write(
+          `data: ${JSON.stringify({
+            type: "new_observation",
+            observation: {
+              id: 10,
+              title: "Markdown * edge",
+              subtitle: "underscore_value",
+              narrative: "direct send narrative",
+              facts: JSON.stringify(["direct send fact"]),
+            },
+            timestamp: Date.now(),
+          })}\n\n`
+        );
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      assert.equal(telegramBodies.length, 1);
+      assert.equal(telegramBodies[0].chat_id, "12345");
+      assert.ok(!("parse_mode" in telegramBodies[0]));
+      assert.ok(telegramBodies[0].text.includes("Markdown * edge"));
+      assert.ok(telegramBodies[0].text.includes("underscore_value"));
+      assert.ok(!telegramBodies[0].text.includes("direct send narrative"));
+      assert.ok(!telegramBodies[0].text.includes("direct send fact"));
+
+      await getService().stop({});
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("uses OpenClaw Telegram runtime before direct bot token fallback", async () => {
+    const originalFetch = globalThis.fetch;
+    let directTelegramCalls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("https://api.telegram.org/")) {
+        directTelegramCalls++;
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    try {
+      const { api, sentMessages, getService } = createMockApi({
+        workerPort: serverPort,
+        observationFeed: {
+          enabled: true,
+          channel: "telegram",
+          to: "12345",
+          botToken: "test-token",
+        },
+      });
+      claudeMemPlugin(api);
+
+      await getService().start({});
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      for (const res of serverResponses) {
+        res.write(
+          `data: ${JSON.stringify({
+            type: "new_observation",
+            observation: { id: 11, title: "Runtime path", subtitle: "uses channel" },
+            timestamp: Date.now(),
+          })}\n\n`
+        );
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      assert.equal(sentMessages.length, 1);
+      assert.equal(sentMessages[0].channel, "telegram");
+      assert.equal(directTelegramCalls, 0);
+
+      await getService().stop({});
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it("filters out non-observation events", async () => {

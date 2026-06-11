@@ -44,9 +44,18 @@ interface BeforePromptBuildResult {
 interface ToolResultPersistEvent {
   toolName?: string;
   params?: Record<string, unknown>;
+  toolCallId?: string;
   message?: {
     content?: Array<{ type: string; text?: string }>;
   };
+}
+
+interface AfterToolCallEvent {
+  toolName?: string;
+  params?: Record<string, unknown>;
+  toolCallId?: string;
+  result?: unknown;
+  error?: string;
 }
 
 interface AgentEndEvent {
@@ -119,6 +128,7 @@ interface OpenClawPluginApi {
   on: ((event: "before_prompt_build", callback: PromptBuildCallback) => void) &
       ((event: "before_agent_start", callback: EventCallback<BeforeAgentStartEvent>) => void) &
       ((event: "tool_result_persist", callback: EventCallback<ToolResultPersistEvent>) => void) &
+      ((event: "after_tool_call", callback: EventCallback<AfterToolCallEvent>) => void) &
       ((event: "agent_end", callback: EventCallback<AgentEndEvent>) => void) &
       ((event: "session_start", callback: EventCallback<SessionStartEvent>) => void) &
       ((event: "session_end", callback: EventCallback<SessionEndEvent>) => void) &
@@ -134,6 +144,7 @@ interface ObservationSSEPayload {
   id: number;
   memory_session_id: string;
   session_id: string;
+  platform_source?: string | null;
   type: string;
   title: string | null;
   subtitle: string | null;
@@ -154,6 +165,27 @@ interface SSENewObservationEvent {
   timestamp: number;
 }
 
+interface SummarySSEPayload {
+  id: number;
+  session_id: string;
+  platform_source?: string | null;
+  request: string | null;
+  investigated: string | null;
+  learned: string | null;
+  completed: string | null;
+  next_steps: string | null;
+  notes: string | null;
+  project: string | null;
+  prompt_number: number;
+  created_at_epoch: number;
+}
+
+interface SSENewSummaryEvent {
+  type: "new_summary";
+  summary: SummarySSEPayload;
+  timestamp: number;
+}
+
 type ConnectionState = "disconnected" | "connected" | "reconnecting";
 
 const DETAILED_FEED_TYPES = new Set(["security_alert", "security_note", "bugfix", "decision"]);
@@ -165,6 +197,8 @@ interface FeedEmojiConfig {
   primary?: string;
   claudeCode?: string;
   claudeCodeLabel?: string;
+  codex?: string;
+  codexLabel?: string;
   default?: string;
   agents?: Record<string, string>;
 }
@@ -173,6 +207,7 @@ interface ClaudeMemPluginConfig {
   syncMemoryFile?: boolean;
   syncMemoryFileExclude?: string[];
   project?: string;
+  platformSource?: string;
   workerPort?: number;
   workerHost?: string;
   observationFeed?: {
@@ -187,6 +222,11 @@ interface ClaudeMemPluginConfig {
 const MAX_SSE_BUFFER_SIZE = 1024 * 1024; 
 const DEFAULT_WORKER_PORT = 37777;
 const DEFAULT_WORKER_HOST = "127.0.0.1";
+const DEFAULT_OPENCLAW_PLATFORM_SOURCE = "openclaw";
+const DUPLICATE_PROMPT_INIT_WINDOW_MS = 30_000;
+const MAX_TOOL_RESPONSE_LENGTH = 1000;
+const AFTER_TOOL_CALL_FALLBACK_DELAY_MS = 500;
+const TOOL_EVENT_DEDUPE_TTL_MS = 10_000;
 
 const EMOJI_POOL = [
   "🔧","📐","🔍","💻","🧪","🐛","🛡️","☁️","📦","🎯",
@@ -204,33 +244,80 @@ function poolEmojiForAgent(agentId: string): string {
 const DEFAULT_PRIMARY_EMOJI = "🦞";
 const DEFAULT_CLAUDE_CODE_EMOJI = "⌨️";
 const DEFAULT_CLAUDE_CODE_LABEL = "Claude Code Session";
+const DEFAULT_CODEX_EMOJI = "🤖";
+const DEFAULT_CODEX_LABEL = "Codex Session";
 const DEFAULT_FALLBACK_EMOJI = "🦀";
+
+function normalizeFeedPlatformSource(value: string | null | undefined): string {
+  const source = (value || "").trim().toLowerCase().replace(/\s+/g, "-");
+  if (!source) return "";
+  if (source.includes("codex")) return "codex";
+  if (source.includes("claude")) return "claude";
+  if (source.includes("openclaw")) return "openclaw";
+  return source;
+}
+
+function resolveConfiguredPlatformSource(configured: string | null | undefined): string {
+  return normalizeFeedPlatformSource(configured) || DEFAULT_OPENCLAW_PLATFORM_SOURCE;
+}
+
+function inferObservationPlatformSource(
+  observation: Pick<ObservationSSEPayload, "platform_source" | "memory_session_id">
+): string {
+  const explicit = normalizeFeedPlatformSource(observation.platform_source);
+  if (explicit) return explicit;
+
+  const memorySessionId = (observation.memory_session_id || "").toLowerCase();
+  if (memorySessionId.includes("codex")) return "codex";
+  if (memorySessionId.includes("claude")) return "claude";
+  if (memorySessionId.includes("openclaw")) return "openclaw";
+
+  return "";
+}
 
 function buildGetSourceLabel(
   emojiConfig: FeedEmojiConfig | undefined
-): (project: string | null | undefined) => string {
+): (observation: Pick<ObservationSSEPayload, "project" | "platform_source" | "memory_session_id">) => string {
   const primary = emojiConfig?.primary ?? DEFAULT_PRIMARY_EMOJI;
   const claudeCode = emojiConfig?.claudeCode ?? DEFAULT_CLAUDE_CODE_EMOJI;
   const claudeCodeLabel = emojiConfig?.claudeCodeLabel ?? DEFAULT_CLAUDE_CODE_LABEL;
+  const codex = emojiConfig?.codex ?? DEFAULT_CODEX_EMOJI;
+  const codexLabel = emojiConfig?.codexLabel ?? DEFAULT_CODEX_LABEL;
   const fallback = emojiConfig?.default ?? DEFAULT_FALLBACK_EMOJI;
   const pinnedAgents = emojiConfig?.agents ?? {};
 
-  return function getSourceLabel(project: string | null | undefined): string {
+  function formatExternalSource(icon: string, label: string, project: string): string {
+    const trimmedLabel = label.trim();
+    if (!trimmedLabel) {
+      return `${icon} ${project}`;
+    }
+    return `${icon} ${trimmedLabel} (${project})`;
+  }
+
+  return function getSourceLabel(observation: Pick<ObservationSSEPayload, "project" | "platform_source" | "memory_session_id">): string {
+    const project = observation.project;
     if (!project) return fallback;
+    const platformSource = inferObservationPlatformSource(observation);
+    if (platformSource.includes("codex")) {
+      return formatExternalSource(codex, codexLabel, project);
+    }
     if (project.startsWith("openclaw-")) {
       const agentId = project.slice("openclaw-".length);
-      if (!agentId) return `${primary} openclaw`;
-      const emoji = pinnedAgents[agentId] || poolEmojiForAgent(agentId);
-      return `${emoji} ${agentId}`;
+      if (!agentId) return `${primary} OpenClaw`;
+      const emoji = pinnedAgents[agentId] || primary;
+      return `${emoji} OpenClaw (${agentId})`;
     }
     if (project === "openclaw") {
-      return `${primary} openclaw`;
+      return `${primary} OpenClaw`;
     }
-    const trimmedLabel = claudeCodeLabel.trim();
-    if (!trimmedLabel) {
-      return `${claudeCode} ${project}`;
+
+    if (platformSource && !platformSource.includes("openclaw")) {
+      return formatExternalSource(claudeCode, claudeCodeLabel, project);
     }
-    return `${claudeCode} ${trimmedLabel} (${project})`;
+    if (platformSource.includes("openclaw")) {
+      return `${primary} ${project}`;
+    }
+    return formatExternalSource(claudeCode, claudeCodeLabel, project);
   };
 }
 
@@ -355,6 +442,45 @@ function workerPostFireAndForget(
   });
 }
 
+function truncateToolResponseText(text: string): string {
+  return text.length > MAX_TOOL_RESPONSE_LENGTH ? text.slice(0, MAX_TOOL_RESPONSE_LENGTH) : text;
+}
+
+function extractToolResponseTextFromPersistEvent(event: ToolResultPersistEvent): string {
+  const content = event.message?.content;
+  if (!Array.isArray(content)) return "";
+
+  return truncateToolResponseText(content
+    .filter((block) => (block.type === "tool_result" || block.type === "text") && "text" in block)
+    .map((block) => String(block.text))
+    .join("\n"));
+}
+
+function stringifyToolResult(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function extractToolResponseTextFromAfterToolCall(event: AfterToolCallEvent): string {
+  const response = stringifyToolResult(event.result);
+  const text = event.error ? `Error: ${event.error}${response ? `\n${response}` : ""}` : response;
+  return truncateToolResponseText(text);
+}
+
+function safeJsonFingerprint(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? {})?.slice(0, 200) ?? "";
+  } catch {
+    return String(value ?? "").slice(0, 200);
+  }
+}
+
 async function workerGetText(
   port: number,
   path: string,
@@ -398,10 +524,10 @@ async function workerGetJson(
 
 function formatObservationMessage(
   observation: ObservationSSEPayload,
-  getSourceLabel: (project: string | null | undefined) => string,
+  getSourceLabel: (observation: Pick<ObservationSSEPayload, "project" | "platform_source" | "memory_session_id">) => string,
 ): string {
   const title = observation.title || "Untitled";
-  const source = getSourceLabel(observation.project);
+  const source = getSourceLabel(observation);
   const isDetailed = DETAILED_FEED_TYPES.has(observation.type);
   const parts = [`${source}\n**${title}**`];
   if (observation.subtitle) {
@@ -448,6 +574,34 @@ function parseStringArray(value: string | null | undefined): string[] {
   }
 }
 
+function formatSummaryMessage(
+  summary: SummarySSEPayload,
+  getSourceLabel: (observation: Pick<ObservationSSEPayload, "project" | "platform_source" | "memory_session_id">) => string,
+): string {
+  const source = getSourceLabel({
+    project: summary.project,
+    platform_source: summary.platform_source,
+    memory_session_id: summary.session_id,
+  });
+  const title = summary.request || "Session summary";
+  const parts = [`${source}\n**${title}**`];
+
+  if (summary.completed) {
+    parts.push(`Completed\n${truncateText(summary.completed, 420)}`);
+  }
+  if (summary.learned) {
+    parts.push(`Learned\n${truncateText(summary.learned, 420)}`);
+  }
+  if (summary.next_steps) {
+    parts.push(`Next\n${truncateText(summary.next_steps, 320)}`);
+  }
+  if (summary.notes) {
+    parts.push(`Notes\n${truncateText(summary.notes, 260)}`);
+  }
+
+  return truncateText(parts.join("\n\n"), 1200);
+}
+
 const CHANNEL_SEND_MAP: Record<string, { namespace: string; functionName: string }> = {
   telegram: { namespace: "telegram", functionName: "sendMessageTelegram" },
   whatsapp: { namespace: "whatsapp", functionName: "sendMessageWhatsApp" },
@@ -471,7 +625,6 @@ async function sendDirectTelegram(
       body: JSON.stringify({
         chat_id: chatId,
         text,
-        parse_mode: "Markdown",
       }),
     });
     if (!response.ok) {
@@ -484,17 +637,13 @@ async function sendDirectTelegram(
   }
 }
 
-function sendToChannel(
+async function sendToChannel(
   api: OpenClawPluginApi,
   channel: string,
   to: string,
   text: string,
   botToken?: string
 ): Promise<void> {
-  if (botToken && channel === "telegram") {
-    return sendDirectTelegram(botToken, to, text, api.logger);
-  }
-
   const mapping = CHANNEL_SEND_MAP[channel];
   if (!mapping) {
     api.logger.warn(`[claude-mem] Unsupported channel type: ${channel}`);
@@ -502,25 +651,27 @@ function sendToChannel(
   }
 
   const channelApi = api.runtime.channel[mapping.namespace];
-  if (!channelApi) {
-    api.logger.warn(`[claude-mem] Channel "${channel}" not available in runtime`);
-    return Promise.resolve();
+  const senderFunction = channelApi?.[mapping.functionName];
+  if (typeof senderFunction === "function") {
+    const args: unknown[] = channel === "whatsapp"
+      ? [to, text, { verbose: false }]
+      : [to, text];
+
+    try {
+      await senderFunction.call(channelApi, ...args);
+      return;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      api.logger.error(`[claude-mem] Failed to send to ${channel}: ${message}`);
+    }
   }
 
-  const senderFunction = channelApi[mapping.functionName];
-  if (!senderFunction) {
-    api.logger.warn(`[claude-mem] Channel "${channel}" has no ${mapping.functionName} function`);
-    return Promise.resolve();
+  if (botToken && channel === "telegram") {
+    return sendDirectTelegram(botToken, to, text, api.logger);
   }
 
-  const args: unknown[] = channel === "whatsapp"
-    ? [to, text, { verbose: false }]
-    : [to, text];
-
-  return senderFunction(...args).catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    api.logger.error(`[claude-mem] Failed to send to ${channel}: ${message}`);
-  });
+  api.logger.warn(`[claude-mem] Channel "${channel}" not available in runtime`);
+  return Promise.resolve();
 }
 
 async function connectToSSEStream(
@@ -530,7 +681,7 @@ async function connectToSSEStream(
   to: string,
   abortController: AbortController,
   setConnectionState: (state: ConnectionState) => void,
-  getSourceLabel: (project: string | null | undefined) => string,
+  getSourceLabel: (observation: Pick<ObservationSSEPayload, "project" | "platform_source" | "memory_session_id">) => string,
   botToken?: string
 ): Promise<void> {
   let backoffMs = 1000;
@@ -592,6 +743,10 @@ async function connectToSSEStream(
               const event = parsed as SSENewObservationEvent;
               const message = formatObservationMessage(event.observation, getSourceLabel);
               await sendToChannel(api, channel, to, message, botToken);
+            } else if (parsed.type === "new_summary" && parsed.summary) {
+              const event = parsed as SSENewSummaryEvent;
+              const message = formatSummaryMessage(event.summary, getSourceLabel);
+              await sendToChannel(api, channel, to, message, botToken);
             }
           } catch (parseError: unknown) {
             const errorMessage = parseError instanceof Error ? parseError.message : String(parseError);
@@ -622,6 +777,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   const workerPort = userConfig.workerPort || DEFAULT_WORKER_PORT;
   _workerHost = userConfig.workerHost || DEFAULT_WORKER_HOST;
   const baseProjectName = userConfig.project || "openclaw";
+  const platformSource = resolveConfiguredPlatformSource(userConfig.platformSource);
   const getSourceLabel = buildGetSourceLabel(userConfig.observationFeed?.emojis);
 
   function getProjectName(ctx: EventContext): string {
@@ -631,10 +787,17 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     return baseProjectName;
   }
 
+  function getObservationCwd(ctx: EventContext, projectName: string): string {
+    if (ctx.workspaceDir) return ctx.workspaceDir;
+    return `/openclaw/${projectName}`;
+  }
+
   const sessionIds = new Map<string, string>();
   const canonicalSessionKeys = new Map<string, string>();
   const sessionAliasesByCanonicalKey = new Map<string, Set<string>>();
   const recentPromptInits = new Map<string, number>();
+  const pendingAfterToolCallFallbacks = new Map<string, ReturnType<typeof setTimeout>>();
+  const persistedToolEvents = new Map<string, number>();
   const syncMemoryFile = userConfig.syncMemoryFile !== false; 
   const syncMemoryFileExclude = new Set(userConfig.syncMemoryFileExclude || []);
 
@@ -693,12 +856,49 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   function shouldSkipDuplicatePromptInit(contentSessionId: string, project: string, prompt: string): boolean {
     const now = Date.now();
     for (const [key, timestamp] of recentPromptInits) {
-      if (now - timestamp > 2000) recentPromptInits.delete(key);
+      if (now - timestamp > DUPLICATE_PROMPT_INIT_WINDOW_MS) {
+        recentPromptInits.delete(key);
+      }
     }
+
     const cacheKey = `${contentSessionId}::${project}::${prompt}`;
     const lastSeenAt = recentPromptInits.get(cacheKey);
     recentPromptInits.set(cacheKey, now);
-    return typeof lastSeenAt === "number" && now - lastSeenAt <= 2000;
+    return typeof lastSeenAt === "number" && now - lastSeenAt <= DUPLICATE_PROMPT_INIT_WINDOW_MS;
+  }
+
+  function shouldSkipInternalPromptInit(prompt: string): boolean {
+    const normalized = prompt.trim();
+    if (normalized.includes("OpenClaw's internal commitment extractor")
+      && normalized.includes("hidden background classification run")
+      && normalized.includes('{"candidates"')) {
+      return true;
+    }
+    if (normalized.startsWith("Read HEARTBEAT.md if it exists")
+      && normalized.includes("heartbeat_respond")) {
+      return true;
+    }
+    if (normalized.startsWith("An async command completion event was triggered")
+      && normalized.includes("reply HEARTBEAT_OK")) {
+      return true;
+    }
+    if (normalized.startsWith("[Inter-session message]")
+      && normalized.includes("isUser=false")) {
+      return true;
+    }
+    if (normalized.includes("[Subagent Context]")
+      && normalized.includes("You are running as a subagent")) {
+      return true;
+    }
+    return false;
+  }
+
+  function stripOpenClawMetadataPrefix(prompt: string): string {
+    const stripped = prompt.trimStart().replace(
+      /^(?:[^\n]+ \(untrusted metadata\):\s*\n```json\s*\n[\s\S]*?\n```\s*)+/,
+      ""
+    ).trimStart();
+    return stripped.trim().length > 0 ? stripped : prompt;
   }
 
   function clearSessionContext(ctx: SessionTrackingContext): void {
@@ -706,10 +906,16 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     const canonicalKey = aliases
       .map((alias) => canonicalSessionKeys.get(alias))
       .find(Boolean) || aliases[0];
+    const contentSessionId = sessionIds.get(canonicalKey);
     const knownAliases = sessionAliasesByCanonicalKey.get(canonicalKey) || new Set([canonicalKey, ...aliases]);
     for (const alias of knownAliases) {
       canonicalSessionKeys.delete(alias);
       sessionIds.delete(alias);
+    }
+    for (const cacheKey of recentPromptInits.keys()) {
+      if (cacheKey.startsWith(`${contentSessionId}::`)) {
+        recentPromptInits.delete(cacheKey);
+      }
     }
     sessionAliasesByCanonicalKey.delete(canonicalKey);
     sessionIds.delete(canonicalKey);
@@ -744,11 +950,10 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     return null;
   }
 
-  // Centralized session-init POST. session_start, after_compaction, and
-  // before_agent_start each call this; the 2s dedup guard
-  // (shouldSkipDuplicatePromptInit) collapses the redundant inits a single
-  // user-message flow produces into one prompt record, while still ensuring a
-  // session is initialized even on flows that never reach before_agent_start.
+  // Centralized session-init POST for prompt-bearing events. session_start and
+  // after_compaction only refresh local session tracking; prompt persistence is
+  // intentionally deferred to before_agent_start so OpenClaw lifecycle noise is
+  // not stored as a user prompt.
   async function initSessionOnce(ctx: EventContext, promptText: string, via: string): Promise<void> {
     const { contentSessionId } = rememberSessionContext(ctx);
     const projectName = getProjectName(ctx);
@@ -762,13 +967,67 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
       contentSessionId,
       project: projectName,
       prompt: promptText,
+      platformSource,
     }, api.logger);
 
     api.logger.info(`[claude-mem] Session initialized via ${via}: contentSessionId=${contentSessionId} project=${projectName}`);
   }
 
+  function toolEventKey(ctx: EventContext, toolName: string, toolCallId: string | undefined, params: unknown): string {
+    const { canonicalKey } = rememberSessionContext(ctx);
+    const stableToolId = toolCallId || safeJsonFingerprint(params);
+    return `${canonicalKey}:${toolName}:${stableToolId}`;
+  }
+
+  function evictOldToolEventKeys(now = Date.now()): void {
+    for (const [key, timestamp] of persistedToolEvents) {
+      if (now - timestamp > TOOL_EVENT_DEDUPE_TTL_MS) {
+        persistedToolEvents.delete(key);
+      }
+    }
+  }
+
+  function markToolResultPersisted(key: string): void {
+    evictOldToolEventKeys();
+    persistedToolEvents.set(key, Date.now());
+    const pending = pendingAfterToolCallFallbacks.get(key);
+    if (pending) {
+      clearTimeout(pending);
+      pendingAfterToolCallFallbacks.delete(key);
+    }
+  }
+
+  function postToolObservation(
+    toolName: string,
+    params: Record<string, unknown> | undefined,
+    toolResponseText: string,
+    ctx: EventContext,
+    source: "tool_result_persist" | "after_tool_call"
+  ): void {
+    const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
+    const projectName = getProjectName(ctx);
+    const workspaceDir = getObservationCwd(ctx, projectName);
+    if (!ctx.workspaceDir) {
+      api.logger.info(`[claude-mem] Using project fallback cwd for observation: session=${canonicalKey} tool=${toolName} project=${projectName}`);
+    }
+
+    if (source === "after_tool_call") {
+      api.logger.info(`[claude-mem] after_tool_call fallback persisted: tool=${toolName} agent=${ctx.agentId ?? "none"} session=${ctx.sessionKey ?? "none"}`);
+    }
+
+    workerPostFireAndForget(workerPort, "/api/sessions/observations", {
+      contentSessionId,
+      tool_name: toolName,
+      tool_input: params || {},
+      tool_response: toolResponseText,
+      cwd: workspaceDir,
+      platformSource,
+    }, api.logger);
+  }
+
   api.on("session_start", async (_event, ctx) => {
-    await initSessionOnce(ctx, "session start", "session_start");
+    const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
+    api.logger.info(`[claude-mem] Session tracking initialized — prompt capture deferred to before_agent_start: session=${canonicalKey} contentSessionId=${contentSessionId}`);
   });
 
   api.on("message_received", async (event, ctx) => {
@@ -777,11 +1036,21 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   });
 
   api.on("after_compaction", async (_event, ctx) => {
-    await initSessionOnce(ctx, "after compaction", "after_compaction");
+    const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
+    api.logger.info(`[claude-mem] Session preserved after compaction — prompt capture deferred to before_agent_start: session=${canonicalKey} contentSessionId=${contentSessionId}`);
   });
 
   api.on("before_agent_start", async (event, ctx) => {
-    await initSessionOnce(ctx, event.prompt || "agent run", "before_agent_start");
+    const rawPromptText = event.prompt || "agent run";
+    const projectName = getProjectName(ctx);
+    const { contentSessionId } = rememberSessionContext(ctx);
+
+    if (shouldSkipInternalPromptInit(rawPromptText)) {
+      api.logger.info(`[claude-mem] Skipping internal OpenClaw prompt init: contentSessionId=${contentSessionId} project=${projectName}`);
+      return;
+    }
+
+    await initSessionOnce(ctx, stripOpenClawMetadataPrefix(rawPromptText), "before_agent_start");
   });
 
   api.on("before_prompt_build", async (_event, ctx) => {
@@ -801,36 +1070,42 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
 
     if (toolName.startsWith("memory_")) return;
 
-    const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
+    const key = toolEventKey(ctx, toolName, event.toolCallId, event.params);
+    markToolResultPersisted(key);
+    postToolObservation(
+      toolName,
+      event.params,
+      extractToolResponseTextFromPersistEvent(event),
+      ctx,
+      "tool_result_persist"
+    );
+  });
 
-    let toolResponseText = "";
-    const content = event.message?.content;
-    if (Array.isArray(content)) {
-      toolResponseText = content
-        .filter((block) => (block.type === "tool_result" || block.type === "text") && "text" in block)
-        .map((block) => String(block.text))
-        .join("\n");
+  api.on("after_tool_call", (event, ctx) => {
+    const toolName = event.toolName;
+    if (!toolName) return;
+    if (toolName.startsWith("memory_")) return;
+
+    const key = toolEventKey(ctx, toolName, event.toolCallId, event.params);
+    evictOldToolEventKeys();
+    if (persistedToolEvents.has(key) || pendingAfterToolCallFallbacks.has(key)) {
+      return;
     }
 
-    const MAX_TOOL_RESPONSE_LENGTH = 1000;
-    if (toolResponseText.length > MAX_TOOL_RESPONSE_LENGTH) {
-      toolResponseText = toolResponseText.slice(0, MAX_TOOL_RESPONSE_LENGTH);
-    }
-
-    // Fall back to the process cwd when the event carries no workspaceDir, so a
-    // missing ctx field never silently drops a captured observation.
-    const workspaceDir = ctx.workspaceDir || process.cwd();
-    if (!ctx.workspaceDir) {
-      api.logger.info(`[claude-mem] tool_result_persist missing workspaceDir; using process.cwd(): session=${canonicalKey} tool=${toolName}`);
-    }
-
-    workerPostFireAndForget(workerPort, "/api/sessions/observations", {
-      contentSessionId,
-      tool_name: toolName,
-      tool_input: event.params || {},
-      tool_response: toolResponseText,
-      cwd: workspaceDir,
-    }, api.logger);
+    const timer = setTimeout(() => {
+      pendingAfterToolCallFallbacks.delete(key);
+      if (persistedToolEvents.has(key)) {
+        return;
+      }
+      postToolObservation(
+        toolName,
+        event.params,
+        extractToolResponseTextFromAfterToolCall(event),
+        ctx,
+        "after_tool_call"
+      );
+    }, AFTER_TOOL_CALL_FALLBACK_DELAY_MS);
+    pendingAfterToolCallFallbacks.set(key, timer);
   });
 
   api.on("agent_end", async (event, ctx) => {
@@ -857,6 +1132,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     await workerPost(workerPort, "/api/sessions/summarize", {
       contentSessionId,
       last_assistant_message: lastAssistantMessage,
+      platformSource,
     }, api.logger);
   });
 
@@ -870,6 +1146,11 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     sessionIds.clear();
     contextCache.clear();
     recentPromptInits.clear();
+    for (const timer of pendingAfterToolCallFallbacks.values()) {
+      clearTimeout(timer);
+    }
+    pendingAfterToolCallFallbacks.clear();
+    persistedToolEvents.clear();
     canonicalSessionKeys.clear();
     sessionAliasesByCanonicalKey.clear();
     api.logger.info("[claude-mem] Gateway started — session tracking reset");

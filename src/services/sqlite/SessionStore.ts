@@ -28,6 +28,30 @@ function resolveCreateSessionArgs(
   };
 }
 
+function isStrongOpenClawSessionSource(contentSessionId: string, project: string): boolean {
+  const normalizedContentSessionId = contentSessionId.trim().toLowerCase();
+  const normalizedProject = project.trim().toLowerCase();
+  return normalizedContentSessionId.startsWith('openclaw-')
+    || normalizedContentSessionId.includes('openclaw-agent:')
+    || normalizedProject === 'openclaw';
+}
+
+function shouldCorrectPlatformSource(
+  contentSessionId: string,
+  project: string,
+  storedPlatformSource: string,
+  receivedPlatformSource: string
+): boolean {
+  const strongOpenClawSession = isStrongOpenClawSessionSource(contentSessionId, project);
+  if (storedPlatformSource === 'codex' && receivedPlatformSource === 'openclaw') {
+    return strongOpenClawSession;
+  }
+  if (storedPlatformSource === 'openclaw' && receivedPlatformSource === 'codex') {
+    return !strongOpenClawSession;
+  }
+  return false;
+}
+
 export class SessionStore {
   public db: Database;
 
@@ -1736,9 +1760,16 @@ export class SessionStore {
               AND COALESCE(platform_source, '') = ''
           `).run(resolved.platformSource, contentSessionId);
         } else if (storedPlatformSource !== resolved.platformSource) {
+          if (shouldCorrectPlatformSource(contentSessionId, project, storedPlatformSource, resolved.platformSource)) {
+            this.db.prepare(`
+              UPDATE sdk_sessions SET platform_source = ?
+              WHERE content_session_id = ?
+            `).run(resolved.platformSource, contentSessionId);
+          } else {
           throw new Error(
             `Platform source conflict for session ${contentSessionId}: existing=${storedPlatformSource}, received=${resolved.platformSource}`
           );
+          }
         }
       }
       return existing.id;
