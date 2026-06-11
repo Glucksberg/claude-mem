@@ -365,7 +365,7 @@ describe("Observation I/O event handlers", () => {
       message: {
         content: [{ type: "text", text: "file contents here..." }],
       },
-    }, { sessionKey: "test-agent" });
+    }, { sessionKey: "test-agent", workspaceDir: "/workspace" });
 
     await new Promise((resolve) => setTimeout(resolve, 100));
 
@@ -403,7 +403,7 @@ describe("Observation I/O event handlers", () => {
       message: {
         content: [{ type: "text", text: longText }],
       },
-    }, {});
+    }, { workspaceDir: "/workspace" });
 
     await new Promise((resolve) => setTimeout(resolve, 100));
 
@@ -467,7 +467,7 @@ describe("Observation I/O event handlers", () => {
     const { api, fireEvent } = createMockApi({ workerPort, project: "my-project" });
     claudeMemPlugin(api);
 
-    await fireEvent("session_start", { sessionId: "s1" }, {});
+    await fireEvent("before_agent_start", { prompt: "hello" }, {});
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     const initRequest = receivedRequests.find((r) => r.url === "/api/sessions/init");
@@ -503,14 +503,14 @@ describe("Observation I/O event handlers", () => {
     const { api, fireEvent } = createMockApi({ workerPort });
     claudeMemPlugin(api);
 
-    await fireEvent("session_start", { sessionId: "s1" }, { sessionKey: "reuse-test" });
+    await fireEvent("before_agent_start", { prompt: "hello" }, { sessionKey: "reuse-test" });
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     await fireEvent("tool_result_persist", {
       toolName: "Read",
       params: { file_path: "/src/index.ts" },
       message: { content: [{ type: "text", text: "contents" }] },
-    }, { sessionKey: "reuse-test" });
+    }, { sessionKey: "reuse-test", workspaceDir: "/workspace" });
 
     await new Promise((resolve) => setTimeout(resolve, 100));
 
