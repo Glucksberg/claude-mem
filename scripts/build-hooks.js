@@ -225,6 +225,7 @@ async function buildHooks() {
       description: 'Runtime dependencies for claude-mem bundled hooks',
       type: 'module',
       dependencies: {
+        '@earendil-works/pi-ai': '^0.74.0',
         'zod': '^4.4.3',
         'tree-sitter-cli': '^0.26.5',
         'tree-sitter-c': '^0.24.1',
@@ -308,6 +309,8 @@ async function buildHooks() {
         'better-auth/node',
         'better-auth/plugins',
         '@better-auth/api-key',
+        '@earendil-works/pi-ai',
+        '@earendil-works/pi-ai/oauth',
       ],
       define: {
         '__DEFAULT_PACKAGE_VERSION__': `"${version}"`,
