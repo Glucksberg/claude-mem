@@ -2,16 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, afterAll, mock } from 'bun
 import fs from 'node:fs';
 import path from 'node:path';
 
-// Capture real exports before mock.module mutates the live namespace, then
-// re-register the snapshots in afterAll so these mocks do not leak into later
-// test files (bun's mock.module is process-global; mock.restore() does NOT undo it).
-import * as realSettingsDefaultsManager from '../../../src/shared/SettingsDefaultsManager.js';
 import * as realPaths from '../../../src/shared/paths.js';
 import * as realLogger from '../../../src/utils/logger.js';
 import * as realSupervisor from '../../../src/supervisor/index.ts';
 import * as realEnvSanitizer from '../../../src/supervisor/env-sanitizer.js';
-const realSettingsSnapshot = { ...realSettingsDefaultsManager };
-const realPathsSnapshot = { ...realPaths };
 const realLoggerSnapshot = { ...realLogger };
 const realSupervisorSnapshot = { ...realSupervisor };
 const realEnvSanitizerSnapshot = { ...realEnvSanitizer };
@@ -26,12 +20,8 @@ const realChildProcess = require('node:child_process');
 // transport" path through disposeCurrentSubprocess(), which tree-kills via
 // killProcessTree() before nulling the handles.
 
-const ORIGINAL_CLAUDE_MEM_DATA_DIR = process.env.CLAUDE_MEM_DATA_DIR;
-const FAKE_DATA_DIR = `/tmp/fake-claude-mem-${process.pid}`;
-const FAKE_CHROMA_DIR = path.join(FAKE_DATA_DIR, 'chroma');
+const FAKE_CHROMA_DIR = realPaths.paths.chroma();
 const FAKE_CHROMA_LOCK = path.join(FAKE_CHROMA_DIR, '.claude-mem-chroma-mcp.lock');
-
-process.env.CLAUDE_MEM_DATA_DIR = FAKE_DATA_DIR;
 
 let transportCount = 0;
 const transportInstances: Array<FakeTransport> = [];
@@ -91,22 +81,6 @@ class FakeClient {
 
 mock.module('@modelcontextprotocol/sdk/client/index.js', () => ({
   Client: FakeClient,
-}));
-
-mock.module('../../../src/shared/SettingsDefaultsManager.js', () => ({
-  SettingsDefaultsManager: {
-    get: () => '',
-    getInt: () => 0,
-    loadFromFile: () => ({}),
-  },
-}));
-
-mock.module('../../../src/shared/paths.js', () => ({
-  USER_SETTINGS_PATH: '/tmp/fake-settings.json',
-  paths: {
-    chroma: () => FAKE_CHROMA_DIR,
-    combinedCerts: () => '/tmp/fake-combined-certs.pem',
-  },
 }));
 
 mock.module('../../../src/utils/logger.js', () => ({
@@ -197,8 +171,6 @@ afterAll(() => {
   (ChromaMcpManager as unknown as {
     killProcessTree: (pid: number) => Promise<void>;
   }).killProcessTree = originalKillProcessTree;
-  mock.module('../../../src/shared/SettingsDefaultsManager.js', () => realSettingsSnapshot);
-  mock.module('../../../src/shared/paths.js', () => realPathsSnapshot);
   mock.module('../../../src/utils/logger.js', () => realLoggerSnapshot);
   mock.module('../../../src/supervisor/index.ts', () => realSupervisorSnapshot);
   mock.module('../../../src/supervisor/env-sanitizer.js', () => realEnvSanitizerSnapshot);
@@ -241,12 +213,7 @@ describe('ChromaMcpManager singleton enforcement (#2313)', () => {
 
   afterAll(() => {
     restoreProcessKill();
-    try { fs.rmSync(FAKE_DATA_DIR, { recursive: true, force: true }); } catch { /* best-effort */ }
-    if (ORIGINAL_CLAUDE_MEM_DATA_DIR === undefined) {
-      delete process.env.CLAUDE_MEM_DATA_DIR;
-    } else {
-      process.env.CLAUDE_MEM_DATA_DIR = ORIGINAL_CLAUDE_MEM_DATA_DIR;
-    }
+    try { fs.rmSync(FAKE_CHROMA_DIR, { recursive: true, force: true }); } catch { /* best-effort */ }
   });
 
   it('serializes concurrent ensureConnected() calls into one spawn', async () => {
