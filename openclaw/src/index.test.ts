@@ -521,7 +521,7 @@ describe("Observation I/O event handlers", () => {
     assert.equal(obsRequest!.body.tool_response, "file contents here...");
     assert.ok(obsRequest!.body.contentSessionId.startsWith("openclaw-test-agent-"));
     assert.equal(obsRequest!.body.platformSource, "openclaw");
-    assert.equal(obsRequest!.body.cwd, "/openclaw/openclaw");
+    assert.equal(obsRequest!.body.cwd, "/workspace");
   });
 
   it("after_tool_call sends observation when no tool_result_persist arrives", async () => {
