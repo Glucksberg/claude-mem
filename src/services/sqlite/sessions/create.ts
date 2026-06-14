@@ -32,6 +32,9 @@ function shouldCorrectPlatformSource(
   if (storedPlatformSource === 'codex' && receivedPlatformSource === 'openclaw') {
     return strongOpenClawSession;
   }
+  if (storedPlatformSource === 'claude' && receivedPlatformSource === 'openclaw') {
+    return strongOpenClawSession;
+  }
   if (storedPlatformSource === 'openclaw' && receivedPlatformSource === 'codex') {
     return !strongOpenClawSession;
   }

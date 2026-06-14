@@ -42,13 +42,13 @@ function platformSessionLabel(platformSource: string | undefined): string {
   }
 }
 
-function normalizeTitleForPlatform(title: string | null | undefined, platformSource: string | undefined): string {
-  const value = title ?? '';
-  if (normalizePlatformSource(platformSource) !== 'codex') {
-    return value;
+function normalizeDisplayTextForPlatform(value: string | null | undefined, platformSource: string | undefined): string {
+  const text = value ?? '';
+  if (normalizePlatformSource(platformSource) === 'claude') {
+    return text;
   }
 
-  return value.replace(/^Claude Code Session\b/i, platformSessionLabel(platformSource));
+  return text.replace(/\bClaude Code Session\b/gi, platformSessionLabel(platformSource));
 }
 
 function escapeMarkdownV2(value: string): string {
@@ -71,8 +71,8 @@ export function formatMessage(
 ): string {
   const emoji = TYPE_EMOJI[obs.type] ?? DEFAULT_EMOJI;
   const type = escapeMarkdownV2(obs.type);
-  const title = escapeMarkdownV2(normalizeTitleForPlatform(obs.title, platformSource));
-  const subtitle = escapeMarkdownV2(obs.subtitle ?? '');
+  const title = escapeMarkdownV2(normalizeDisplayTextForPlatform(obs.title, platformSource));
+  const subtitle = escapeMarkdownV2(normalizeDisplayTextForPlatform(obs.subtitle, platformSource));
   const projectEscaped = escapeMarkdownV2(project);
   const idEscaped = escapeMarkdownV2(String(observationId));
   return `${emoji} *${type}* — ${title}\n${subtitle}\nProject: \`${projectEscaped}\` · obs \\#${idEscaped}`;

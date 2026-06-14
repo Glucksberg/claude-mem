@@ -17,6 +17,7 @@ import { parseFileList } from './observations/files.js';
 import { DEFAULT_PLATFORM_SOURCE, normalizePlatformSource, sortPlatformSources } from '../../shared/platform-source.js';
 import { findRecentDuplicateUserPrompt as findRecentDuplicateUserPromptRecord } from './prompts/get.js';
 import { normalizeStoredPromptText } from './prompt-storage.js';
+import { platformSourceSql } from './platform-source-sql.js';
 
 function resolveCreateSessionArgs(
   customTitle?: string,
@@ -44,6 +45,9 @@ function shouldCorrectPlatformSource(
 ): boolean {
   const strongOpenClawSession = isStrongOpenClawSessionSource(contentSessionId, project);
   if (storedPlatformSource === 'codex' && receivedPlatformSource === 'openclaw') {
+    return strongOpenClawSession;
+  }
+  if (storedPlatformSource === 'claude' && receivedPlatformSource === 'openclaw') {
     return strongOpenClawSession;
   }
   if (storedPlatformSource === 'openclaw' && receivedPlatformSource === 'codex') {
@@ -1217,7 +1221,7 @@ export class SessionStore {
         o.subtitle,
         o.text,
         o.project,
-        COALESCE(s.platform_source, '${DEFAULT_PLATFORM_SOURCE}') as platform_source,
+        ${platformSourceSql('o')} as platform_source,
         o.prompt_number,
         o.created_at,
         o.created_at_epoch
@@ -1269,7 +1273,7 @@ export class SessionStore {
         ss.files_edited,
         ss.notes,
         ss.project,
-        COALESCE(s.platform_source, '${DEFAULT_PLATFORM_SOURCE}') as platform_source,
+        ${platformSourceSql('ss')} as platform_source,
         ss.prompt_number,
         ss.created_at,
         ss.created_at_epoch
@@ -1312,7 +1316,7 @@ export class SessionStore {
         up.id,
         up.content_session_id,
         s.project,
-        COALESCE(s.platform_source, '${DEFAULT_PLATFORM_SOURCE}') as platform_source,
+        ${platformSourceSql('s')} as platform_source,
         up.prompt_number,
         up.prompt_text,
         up.created_at,
