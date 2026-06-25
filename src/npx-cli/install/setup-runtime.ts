@@ -241,21 +241,18 @@ export function verifyCriticalModules(targetDir: string): void {
 
   const unresolvable: string[] = [];
 
-  // Each declared dependency must be installed, not merely a directory on disk.
+  // Each declared dependency must be installed. Some ESM-only packages expose
+  // only an `import` condition, so createRequire().resolve(dep) is allowed to
+  // fail even when the package is correctly installed.
   for (const dep of dependencies) {
     try {
       requireFromTarget.resolve(dep, { paths: resolvePaths });
     } catch {
       // Bare-name resolution can fail for a perfectly-installed package that has
-      // no importable entry point — e.g. bin-only packages like `tree-sitter-cli`
-      // (package.json has `bin` but no `main`/`module`/`exports`/`index.js`).
-      // Fall back to resolving its package.json to distinguish "installed but
-      // bin-only" from "genuinely missing": a truly absent package fails both.
-      // This preserves the original "is it installed" guarantee while still
-      // upgrading from directory-existence to real module resolution (#2730).
-      try {
-        requireFromTarget.resolve(`${dep}/package.json`, { paths: resolvePaths });
-      } catch {
+      // no CommonJS-resolvable entry point, no entry point at all (bin-only), or
+      // an exports map that hides package.json. Fall back to the physical
+      // manifest path to distinguish "installed" from "missing".
+      if (!existsSync(join(nodeModulesPath, ...dep.split('/'), 'package.json'))) {
         unresolvable.push(dep);
       }
     }

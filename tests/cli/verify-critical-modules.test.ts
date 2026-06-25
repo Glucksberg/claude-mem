@@ -47,6 +47,28 @@ function writeFakeBinOnlyPackage(targetDir: string, name: string, binName: strin
   writeFileSync(join(pkgDir, 'cli.js'), '#!/usr/bin/env node\n');
 }
 
+function writeFakeImportOnlyPackage(targetDir: string, name: string): void {
+  const pkgDir = join(targetDir, 'node_modules', ...name.split('/'));
+  mkdirSync(pkgDir, { recursive: true });
+  writeFileSync(
+    join(pkgDir, 'package.json'),
+    JSON.stringify({
+      name,
+      version: '0.0.0',
+      type: 'module',
+      exports: {
+        '.': {
+          types: './dist/index.d.ts',
+          import: './dist/index.js',
+        },
+      },
+    }),
+  );
+  mkdirSync(join(pkgDir, 'dist'), { recursive: true });
+  writeFileSync(join(pkgDir, 'dist', 'index.js'), 'export default {};\n');
+  writeFileSync(join(pkgDir, 'dist', 'index.d.ts'), 'declare const value: unknown;\nexport default value;\n');
+}
+
 function writeRootPackage(targetDir: string, dependencies: Record<string, string>): void {
   writeFileSync(
     join(targetDir, 'package.json'),
@@ -108,6 +130,19 @@ describe('verifyCriticalModules', () => {
       './v4-mini': './v4-mini/index.js',
     });
     writeFakeBinOnlyPackage(tempDir, 'faux-cli', 'faux');
+
+    expect(() => verifyCriticalModules(tempDir)).not.toThrow();
+  });
+
+  it('does NOT false-fail on an ESM-only import-condition dependency', () => {
+    writeRootPackage(tempDir, { zod: '^4.0.0', '@scope/import-only': '^1.0.0' });
+    writeFakePackage(tempDir, 'zod', {
+      '.': './index.js',
+      './v3': './v3/index.js',
+      './v4': './v4/index.js',
+      './v4-mini': './v4-mini/index.js',
+    });
+    writeFakeImportOnlyPackage(tempDir, '@scope/import-only');
 
     expect(() => verifyCriticalModules(tempDir)).not.toThrow();
   });

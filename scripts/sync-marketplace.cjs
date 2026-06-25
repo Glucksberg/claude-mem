@@ -33,12 +33,11 @@ function verifyCriticalModules(targetDir, label) {
     try {
       requireFromTarget.resolve(dep, { paths: resolvePaths });
     } catch {
-      // Bin-only packages (e.g. tree-sitter-cli) have no importable entry point;
-      // fall back to resolving package.json to tell "installed but bin-only"
-      // apart from "genuinely missing".
-      try {
-        requireFromTarget.resolve(`${dep}/package.json`, { paths: resolvePaths });
-      } catch {
+      // Some ESM-only packages expose only an `import` condition, and bin-only
+      // packages have no importable entry point. A physical manifest still tells
+      // us the dependency is installed; explicit subpath checks below cover the
+      // exports the worker is known to require.
+      if (!existsSync(path.join(nodeModulesPath, ...dep.split('/'), 'package.json'))) {
         unresolvable.push(dep);
       }
     }
