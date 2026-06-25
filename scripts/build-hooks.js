@@ -72,7 +72,21 @@ function shellTemplateManifest(buildShellCommand) {
   });
   const codexHook = (tail, extra = {}) => buildShellCommand({
     host: 'codex-cli', requireFile: 'bun-runner.js', requireFileSecondary: 'worker-service.cjs',
-    trailingCommand: ccTrailing(...tail), notFoundMessage: 'claude-mem: plugin scripts not found', ...extra,
+    trailingCommand: ccTrailing(...tail), notFoundMessage: 'claude-mem: plugin scripts not found',
+    extraEnv: { CLAUDE_MEM_CODEX_HOOK: '1' },
+    ...extra,
+  });
+  const codexStartupHook = () => buildShellCommand({
+    host: 'codex-cli',
+    requireFile: 'bun-runner.js',
+    requireFileSecondary: 'worker-service.cjs',
+    trailingCommand: [
+      '_V=$(CLAUDE_MEM_CODEX_HOOK=1 node "$_P/scripts/version-check.js" || true);',
+      'if [ -n "$_V" ]; then printf \'%s\\n\' "$_V"; else',
+      'CLAUDE_MEM_CODEX_HOOK=1', ...ccTrailing('hook', 'codex', 'context'),
+      '; fi',
+    ],
+    notFoundMessage: 'claude-mem: plugin scripts not found',
   });
 
   return {
@@ -95,13 +109,7 @@ function shellTemplateManifest(buildShellCommand) {
     'plugin/hooks/codex-hooks.json': {
       kind: 'hooks',
       commands: {
-        'SessionStart.0.0': buildShellCommand({
-          host: 'codex-cli', requireFile: 'version-check.js', extraEnv: { CLAUDE_MEM_CODEX_HOOK: '1' },
-          trailingCommand: ['node', '"$_P/scripts/version-check.js"'],
-          notFoundMessage: 'claude-mem: version-check.js not found',
-        }),
-        'SessionStart.0.1': codexHook(['start'], { extraEnv: { CLAUDE_MEM_CODEX_HOOK: '1' } }),
-        'SessionStart.0.2': codexHook(['hook', 'codex', 'context']),
+        'SessionStart.0.0': codexStartupHook(),
         'UserPromptSubmit.0.0': codexHook(['hook', 'codex', 'session-init']),
         'PreToolUse.0.0': codexHook(['hook', 'codex', 'file-context']),
         'PostToolUse.0.0': codexHook(['hook', 'codex', 'observation']),
