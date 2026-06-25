@@ -637,6 +637,12 @@ async function buildHooks() {
       }
     }
     const codexHooks = JSON.parse(fs.readFileSync('plugin/hooks/codex-hooks.json', 'utf-8'));
+    const validCodexHookRootKeys = new Set(['hooks']);
+    for (const key of Object.keys(codexHooks)) {
+      if (!validCodexHookRootKeys.has(key)) {
+        throw new Error(`plugin/hooks/codex-hooks.json contains unsupported Codex hook root field: ${key}`);
+      }
+    }
     for (const eventName of Object.keys(codexHooks.hooks ?? {})) {
       if (!validCodexHookEvents.has(eventName)) {
         throw new Error(`plugin/hooks/codex-hooks.json contains unknown Codex hook event: ${eventName}`);

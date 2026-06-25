@@ -2,8 +2,65 @@
 
 const { execSync } = require('child_process');
 const { existsSync, mkdirSync, readFileSync, writeFileSync } = require('fs');
+const { createRequire } = require('module');
 const path = require('path');
 const os = require('os');
+
+// Subpath imports the bundled worker requires transitively (via zod v4's compat
+// exports). A stale/partial `bun install` can leave the `zod` directory present
+// while these subpaths fail to resolve — surfacing later as a runtime
+// `Cannot find module 'zod/v3'` that crashes the worker on startup and hangs
+// every session waiting on it. Mirrors verifyCriticalModules() in
+// src/npx-cli/install/setup-runtime.ts; keep them in sync.
+const ZOD_REQUIRED_SUBPATHS = ['zod/v3', 'zod/v4', 'zod/v4-mini'];
+
+// Assert that an install closure actually resolves its declared dependencies
+// (and zod's subpath exports) from `targetDir`, not merely that the package
+// directories exist on disk. Throws loud so a broken sync fails here instead of
+// shipping a worker that crash-loops in the user's sessions.
+function verifyCriticalModules(targetDir, label) {
+  const pkgPath = path.join(targetDir, 'package.json');
+  if (!existsSync(pkgPath)) return;
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+  const dependencies = Object.keys(pkg.dependencies || {});
+
+  const nodeModulesPath = path.join(targetDir, 'node_modules');
+  const requireFromTarget = createRequire(path.join(nodeModulesPath, 'noop.js'));
+  const resolvePaths = [nodeModulesPath];
+  const unresolvable = [];
+
+  for (const dep of dependencies) {
+    try {
+      requireFromTarget.resolve(dep, { paths: resolvePaths });
+    } catch {
+      // Bin-only packages (e.g. tree-sitter-cli) have no importable entry point;
+      // fall back to resolving package.json to tell "installed but bin-only"
+      // apart from "genuinely missing".
+      try {
+        requireFromTarget.resolve(`${dep}/package.json`, { paths: resolvePaths });
+      } catch {
+        unresolvable.push(dep);
+      }
+    }
+  }
+
+  if (dependencies.includes('zod')) {
+    for (const subpath of ZOD_REQUIRED_SUBPATHS) {
+      try {
+        requireFromTarget.resolve(subpath, { paths: resolvePaths });
+      } catch {
+        unresolvable.push(subpath);
+      }
+    }
+  }
+
+  if (unresolvable.length > 0) {
+    throw new Error(
+      `Post-install check failed in ${label} (${targetDir}): unresolvable modules: ${unresolvable.join(', ')}`,
+    );
+  }
+  console.log(`\x1b[32m%s\x1b[0m`, `✓ Verified critical modules resolve in ${label}`);
+}
 
 const INSTALLED_PATH = path.join(os.homedir(), '.claude', 'plugins', 'marketplaces', 'thedotmack');
 const CACHE_BASE_PATH = path.join(os.homedir(), '.claude', 'plugins', 'cache', 'thedotmack', 'claude-mem');
@@ -92,6 +149,7 @@ function syncPluginCache(label, destinationPath, pluginGitignoreExcludes) {
 
   console.log(`Running bun install in ${label}...`);
   execSync(`bun install`, { cwd: destinationPath, stdio: 'inherit' });
+  verifyCriticalModules(destinationPath, label);
   writeInstallMarker(destinationPath, getPluginVersion());
 }
 
@@ -164,6 +222,9 @@ try {
     'cd ~/.claude/plugins/marketplaces/thedotmack/ && bun install',
     { stdio: 'inherit' }
   );
+  // The marketplace worker (plugin/scripts/worker-service.cjs) resolves zod via
+  // upward traversal into this root node_modules, so verify the closure here.
+  verifyCriticalModules(INSTALLED_PATH, 'marketplace');
 
   const version = getPluginVersion();
   const CACHE_VERSION_PATH = path.join(CACHE_BASE_PATH, version);
